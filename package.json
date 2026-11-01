@@ -1,7 +1,7 @@
 {
   "name": "chatformme",
   "version": "1.0.0",
-  "description": "A tiny self-hosted chat site with no external dependencies, for when the international internet is cut.",
+  "description": "A tiny self-hosted \"message us\" site with private conversations and an admin inbox, with no external dependencies, for when the international internet is cut.",
   "main": "server.js",
   "private": true,
   "scripts": {

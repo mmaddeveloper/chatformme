@@ -1,6 +1,10 @@
 (function () {
   'use strict';
 
+  // Two views share this page:
+  //  - visitors: one private conversation with the site's admins;
+  //  - admins: an inbox of every conversation, and the open conversation.
+
   // ---------- small helpers ----------
 
   var $ = function (id) { return document.getElementById(id); };
@@ -35,9 +39,10 @@
     return node;
   }
 
-  function icon(id) {
+  function icon(id, className) {
     var svg = document.createElementNS(SVG_NS, 'svg');
     svg.setAttribute('aria-hidden', 'true');
+    if (className) svg.setAttribute('class', className);
     var use = document.createElementNS(SVG_NS, 'use');
     use.setAttribute('href', '#' + id);
     svg.appendChild(use);
@@ -47,17 +52,19 @@
   // Stable color (0-7) and initial for each person.
   function colorClass(uid) {
     var h = 0;
+    uid = String(uid || '');
     for (var i = 0; i < uid.length; i++) h = (h * 31 + uid.charCodeAt(i)) >>> 0;
     return 'c' + (h % 8);
   }
   function initial(name) {
-    var chars = Array.from(String(name).trim());
+    var chars = Array.from(String(name || '').trim());
     return chars.length ? chars[0].toUpperCase() : '?';
   }
-  function makeAvatar(user) {
-    var a = el('span', 'avatar ' + colorClass(user.uid || ''), initial(user.name || ''));
-    a.setAttribute('aria-hidden', 'true');
-    return a;
+  function setAvatar(node, uid, name, online) {
+    node.className = 'avatar ' + colorClass(uid) + (online ? ' online' : '');
+    node.textContent = initial(name);
+    node.setAttribute('aria-hidden', 'true');
+    return node;
   }
 
   var ERRORS = {
@@ -67,7 +74,7 @@
     too_long: 'پیام خیلی طولانی است.',
     empty: 'پیام خالی است.',
     forbidden: 'اجازهٔ این کار را ندارید.',
-    not_found: 'پیام پیدا نشد (شاید قبلاً حذف شده).',
+    not_found: 'پیدا نشد (شاید حذف شده).',
     network: 'ارتباط با سرور برقرار نشد. اتصال را بررسی کنید.',
     server_error: 'خطای سرور؛ دوباره تلاش کنید.'
   };
@@ -83,16 +90,28 @@
     user: readJson('chat.user'),
     es: null,
     connState: 'connecting',
-    online: [],
     lastSeq: 0,
     lastEventAt: 0,
     reconnectTimer: null,
     reconnectDelay: 2000,
-    pending: {},      // cid -> { text, li, tries, timer }
-    unread: 0,        // for the tab title
-    unseen: 0,        // for the "new messages" button
-    baseTitle: document.title
+    pending: {},        // cid -> { text, conv, li, tries, timer }
+    unread: 0,          // visitor: unseen replies, for the tab title
+    unseen: 0,          // for the "new messages" button
+    baseTitle: document.title,
+    // visitor
+    adminsOnline: 0,
+    adminRead: 0,       // last of my messages the admins have seen
+    lastReplyId: 0,     // newest admin reply shown
+    readSent: 0,
+    // admin
+    convs: {},          // visitor uid -> summary
+    onlineVisitors: {}, // visitor uid -> true
+    openConv: null,
+    openLoaded: false,
+    openBuffer: []
   };
+
+  function isAdmin() { return !!(state.user && state.user.admin); }
 
   var isTouch = window.matchMedia && window.matchMedia('(hover: none) and (pointer: coarse)').matches;
 
@@ -147,9 +166,9 @@
 
   function showJoin(message) {
     closeStream();
-    closeDrawer();
     $('chat').hidden = true;
     $('join').hidden = false;
+    setConn('online');
     document.title = state.baseTitle;
     var lastName = storage.get('chat.name');
     if (lastName && !$('name').value) $('name').value = lastName;
@@ -168,6 +187,7 @@
     $('password-label').textContent = 'کلید مدیر';
     $('password-row').hidden = false;
     $('admin-toggle').hidden = true;
+    $('join-btn').textContent = 'ورود';
     $('password').focus();
   });
 
@@ -189,38 +209,49 @@
       storage.set('chat.user', JSON.stringify(data.user));
       storage.set('chat.name', data.user.name);
       $('password').value = '';
-      startChat();
+      startApp();
     }, function (err) {
       state.token = oldToken;
       showJoinError(errorText(err));
     }).then(function () { btn.disabled = false; });
   });
 
-  // ---------- chat screen ----------
+  // ---------- app shell ----------
 
+  var app = $('chat');
   var list = $('messages');
   var input = $('input');
   var sendBtn = $('send-btn');
 
-  function startChat() {
+  function startApp() {
     $('join').hidden = true;
-    $('chat').hidden = false;
+    app.hidden = false;
+    app.classList.toggle('is-admin', isAdmin());
+    app.classList.toggle('is-visitor', !isAdmin());
     list.innerHTML = '';
     state.lastSeq = 0;
-    renderMe();
-    relayout();
+    state.convs = {};
+    state.openConv = null;
+    state.adminRead = 0;
+    state.lastReplyId = 0;
+    state.readSent = 0;
+    state.unread = 0;
+    app.classList.remove('conv-open');
+    $('conv-delete').hidden = !isAdmin();
+    $('visitor-logout').hidden = isAdmin();
+    if (isAdmin()) {
+      setAvatar($('me-avatar'), state.user.uid, state.user.name);
+      $('me-name').textContent = state.user.name;
+      input.placeholder = 'پاسخ…';
+      renderConvList();
+    } else {
+      input.placeholder = 'پیام خود را بنویسید…';
+      relayout();
+    }
+    renderTopbar();
     connect();
     updateSendButton();
-    if (!isTouch) input.focus();
-  }
-
-  function renderMe() {
-    var me = state.user;
-    var av = $('me-avatar');
-    av.className = 'avatar ' + colorClass(me.uid);
-    av.textContent = initial(me.name);
-    $('me-name').textContent = me.name;
-    $('me-role').textContent = me.admin ? 'مدیر گفتگو' : 'شما';
+    if (!isAdmin() && !isTouch) input.focus();
   }
 
   function logout() {
@@ -233,53 +264,67 @@
     storage.del('chat.token');
     storage.del('chat.user');
     list.innerHTML = '';
+    $('conv-list').innerHTML = '';
     showJoin();
   }
 
-  $('logout-btn').addEventListener('click', function () {
-    if (window.confirm('از گفتگو خارج می‌شوید؟')) logout();
-  });
+  function confirmLogout() {
+    var msg = isAdmin() ? 'از حساب مدیر خارج می‌شوید؟'
+      : 'خارج می‌شوید؟ با ورود دوباره از همین دستگاه، گفتگوی شما سر جایش است.';
+    if (window.confirm(msg)) logout();
+  }
+  $('logout-btn').addEventListener('click', confirmLogout);
+  $('visitor-logout').addEventListener('click', confirmLogout);
 
   function handleUnauthorized() {
     logout();
     showJoinError('نشست شما منقضی شده یا رمز تغییر کرده؛ لطفاً دوباره وارد شوید.');
   }
 
-  // ---------- people drawer (phones) ----------
+  function renderTopbar() {
+    var status = $('status');
+    var text;
+    var online = false;
+    if (isAdmin()) {
+      var c = state.convs[state.openConv];
+      if (!c) return;
+      online = !!state.onlineVisitors[c.uid];
+      $('chat-title').textContent = c.name;
+      setAvatar($('top-avatar'), c.uid, c.name, online);
+      $('top-avatar').hidden = false;
+      text = online ? 'آنلاین' : 'آفلاین';
+    } else {
+      $('chat-title').textContent = state.baseTitle;
+      online = state.adminsOnline > 0;
+      text = online ? 'پاسخگو آنلاین است' : 'پاسخگو الان آنلاین نیست؛ پیام شما می‌رسد';
+    }
+    status.setAttribute('data-state', online ? 'online' : 'away');
+    $('status-text').textContent = text;
+  }
 
-  var app = $('chat');
-  function openDrawer() {
-    app.classList.add('drawer-open');
-    $('online-btn').setAttribute('aria-expanded', 'true');
-    $('side-close').focus();
+  function updateTitle() {
+    var n = 0;
+    if (isAdmin()) {
+      var ids = Object.keys(state.convs);
+      for (var i = 0; i < ids.length; i++) n += state.convs[ids[i]].unread;
+    } else {
+      n = state.unread;
+    }
+    document.title = (n ? '(' + faNum(n) + ') ' : '') + state.baseTitle;
   }
-  function closeDrawer() {
-    if (!app.classList.contains('drawer-open')) return;
-    app.classList.remove('drawer-open');
-    $('online-btn').setAttribute('aria-expanded', 'false');
-  }
-  $('online-btn').addEventListener('click', openDrawer);
-  $('side-close').addEventListener('click', closeDrawer);
-  $('backdrop').addEventListener('click', closeDrawer);
-  document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') closeDrawer();
-  });
 
   // ---------- connection (Server-Sent Events) ----------
 
-  function setStatus(s) {
+  var connTimer = null;
+  function setConn(s) {
     state.connState = s;
-    renderStatus();
-  }
-
-  function renderStatus() {
-    var s = state.connState;
-    $('status').setAttribute('data-state', s);
-    var text;
-    if (s === 'online') text = faNum(state.online.length) + ' نفر آنلاین';
-    else if (s === 'offline') text = 'اتصال قطع است؛ تلاش دوباره…';
-    else text = 'در حال اتصال…';
-    $('status-text').textContent = text;
+    var box = $('conn');
+    clearTimeout(connTimer);
+    if (s === 'online') { box.hidden = true; return; }
+    box.setAttribute('data-state', s);
+    box.textContent = s === 'offline' ? 'اتصال قطع است؛ تلاش دوباره…' : 'در حال اتصال…';
+    // Short blips are normal; only show the notice if it lasts a moment.
+    connTimer = setTimeout(function () { if (state.token) box.hidden = false; }, 1500);
   }
 
   function closeStream() {
@@ -290,44 +335,59 @@
   function connect() {
     closeStream();
     if (!state.token) return;
-    setStatus('connecting');
+    setConn('connecting');
     var url = '/api/stream?token=' + encodeURIComponent(state.token) + '&since=' + state.lastSeq;
     var es = new EventSource(url);
     state.es = es;
     state.lastEventAt = Date.now();
 
-    function seen(e) {
-      state.lastEventAt = Date.now();
-      if (e.lastEventId) {
-        var n = parseInt(e.lastEventId, 10);
-        if (n > state.lastSeq) state.lastSeq = n;
-      }
+    function on(type, handler) {
+      es.addEventListener(type, function (e) {
+        state.lastEventAt = Date.now();
+        if (e.lastEventId) {
+          var n = parseInt(e.lastEventId, 10);
+          if (type === 'reset' || n > state.lastSeq) state.lastSeq = n || 0;
+        }
+        if (handler) handler(e.data ? JSON.parse(e.data) : null);
+      });
     }
 
     es.onopen = function () {
       state.reconnectDelay = 2000;
       state.lastEventAt = Date.now();
-      setStatus('online');
+      setConn('online');
     };
-    es.addEventListener('reset', function (e) {
-      state.lastEventAt = Date.now();
-      state.lastSeq = parseInt(e.lastEventId, 10) || 0;
-      renderAll(JSON.parse(e.data).messages);
-    });
-    es.addEventListener('msg', function (e) { seen(e); upsertMessage(JSON.parse(e.data)); });
-    es.addEventListener('delete', function (e) { seen(e); removeMessage(JSON.parse(e.data).id); });
-    es.addEventListener('presence', function (e) { seen(e); renderPresence(JSON.parse(e.data)); });
-    es.addEventListener('ping', seen);
+    on('ping');
+    if (isAdmin()) {
+      on('reset', adminReset);
+      on('msg', adminMsg);
+      on('delete', adminDelete);
+      on('read', adminReadEvent);
+      on('convdelete', adminConvDelete);
+      on('presence', adminPresence);
+    } else {
+      on('reset', visitorReset);
+      on('msg', function (d) { visitorMsg(d.message); });
+      on('delete', function (d) { removeMessage(d.id); });
+      on('read', function (d) { state.adminRead = d.adminRead; updateTicks(); });
+      on('convdelete', function () {
+        state.adminRead = 0;
+        state.lastReplyId = 0;
+        state.readSent = 0;
+        renderAll([]);
+      });
+      on('presence', function (d) { state.adminsOnline = d.admins; renderTopbar(); });
+    }
     es.onerror = function () {
       if (es !== state.es) return;
       if (es.readyState === 2 /* CLOSED */) {
         // The browser gave up (bad token, server full, ...). Find out why.
-        setStatus('offline');
+        setConn('offline');
         api('GET', '/api/me').then(scheduleReconnect, function (err) {
           if (err.status === 401) handleUnauthorized(); else scheduleReconnect();
         });
       } else {
-        setStatus('connecting'); // the browser reconnects by itself
+        setConn('connecting'); // the browser reconnects by itself
       }
     };
   }
@@ -335,7 +395,7 @@
   function scheduleReconnect() {
     if (!state.token || state.reconnectTimer) return;
     if (state.es) { state.es.close(); state.es = null; }
-    setStatus('offline');
+    setConn('offline');
     state.reconnectTimer = setTimeout(function () {
       state.reconnectTimer = null;
       connect();
@@ -360,7 +420,242 @@
     }
   });
 
-  // ---------- rendering ----------
+  // ---------- visitor events ----------
+
+  function visitorReset(d) {
+    state.adminRead = d.adminRead || 0;
+    renderAll(d.messages);
+    markReadSoon();
+  }
+
+  function visitorMsg(m) {
+    upsertMessage(m);
+    if (m.from === 'admin') markReadSoon();
+  }
+
+  // ---------- admin events ----------
+
+  function adminReset(d) {
+    state.convs = {};
+    for (var i = 0; i < d.conversations.length; i++) state.convs[d.conversations[i].uid] = d.conversations[i];
+    renderConvList();
+    if (state.openConv) {
+      if (state.convs[state.openConv]) openConversation(state.openConv, true);
+      else closeConversation();
+    }
+  }
+
+  function adminMsg(d) {
+    state.convs[d.summary.uid] = d.summary;
+    renderConvList();
+    if (d.message.conv === state.openConv) {
+      if (!state.openLoaded) state.openBuffer.push(d.message);
+      else upsertMessage(d.message);
+      renderTopbar();
+      if (d.message.from === 'visitor') markReadSoon();
+    }
+  }
+
+  function adminDelete(d) {
+    if (d.summary) state.convs[d.conv] = d.summary;
+    renderConvList();
+    if (d.conv === state.openConv) removeMessage(d.id);
+  }
+
+  function adminReadEvent(d) {
+    state.convs[d.conv] = d.summary;
+    renderConvList();
+    if (d.conv === state.openConv) updateTicks();
+  }
+
+  function adminConvDelete(d) {
+    delete state.convs[d.conv];
+    renderConvList();
+    if (d.conv === state.openConv) closeConversation();
+  }
+
+  function adminPresence(d) {
+    state.onlineVisitors = {};
+    for (var i = 0; i < d.visitors.length; i++) state.onlineVisitors[d.visitors[i]] = true;
+    renderConvList();
+    renderTopbar();
+  }
+
+  // ---------- admin inbox ----------
+
+  function convTime(ts) {
+    var d = new Date(ts);
+    var now = new Date();
+    if (dayKey(ts) === dayKey(now.getTime())) return formatTime(ts);
+    var y = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+    if (dayKey(ts) === dayKey(y.getTime())) return 'دیروز';
+    try { return d.toLocaleDateString('fa-IR', { day: 'numeric', month: 'short' }); } catch (e) { return d.toDateString(); }
+  }
+
+  function renderConvList() {
+    if (!isAdmin()) return;
+    var ul = $('conv-list');
+    var ids = Object.keys(state.convs);
+    var convs = ids.map(function (k) { return state.convs[k]; });
+    convs.sort(function (a, b) { return b.lastTs - a.lastTs; });
+    var frag = document.createDocumentFragment();
+    var total = 0;
+    convs.forEach(function (c) {
+      total += c.unread;
+      var li = el('li');
+      var btn = el('button', 'conv-item' + (c.uid === state.openConv ? ' active' : '') + (c.unread ? ' unread' : ''));
+      btn.type = 'button';
+      btn.appendChild(setAvatar(el('span'), c.uid, c.name, !!state.onlineVisitors[c.uid]));
+      var body = el('div', 'conv-body');
+      var top = el('div', 'conv-top');
+      var name = el('span', 'conv-name', c.name);
+      name.dir = 'auto';
+      top.appendChild(name);
+      top.appendChild(el('span', 'conv-time', convTime(c.lastTs)));
+      body.appendChild(top);
+      var bottom = el('div', 'conv-bottom');
+      var preview = el('span', 'conv-preview');
+      if (c.last) {
+        if (c.last.from === 'admin') preview.appendChild(el('b', '', 'شما: '));
+        preview.appendChild(el('bdi', '', c.last.text.replace(/\s+/g, ' ')));
+      } else {
+        preview.textContent = 'پیامی نیست';
+      }
+      bottom.appendChild(preview);
+      if (c.unread) bottom.appendChild(el('span', 'conv-unread', faNum(c.unread)));
+      body.appendChild(bottom);
+      btn.appendChild(body);
+      btn.addEventListener('click', function () { openConversation(c.uid); });
+      li.appendChild(btn);
+      frag.appendChild(li);
+    });
+    ul.innerHTML = '';
+    ul.appendChild(frag);
+    $('inbox-empty').hidden = convs.length > 0;
+    $('unread-total').hidden = !total;
+    $('unread-total').textContent = faNum(total);
+    updateTitle();
+  }
+
+  function openConversation(uid, keepScroll) {
+    var switching = uid !== state.openConv;
+    state.openConv = uid;
+    state.openLoaded = false;
+    state.openBuffer = [];
+    app.classList.add('conv-open');
+    if (switching) {
+      list.innerHTML = '';
+      $('empty').hidden = false;
+      $('empty-text').textContent = 'در حال بارگذاری…';
+      input.value = '';
+      autosize();
+      updateSendButton();
+    }
+    renderConvList();
+    renderTopbar();
+    api('GET', '/api/conversation?conv=' + encodeURIComponent(uid)).then(function (data) {
+      if (state.openConv !== uid) return;
+      state.convs[uid] = data.summary;
+      renderAll(data.messages, keepScroll && !switching);
+      state.openLoaded = true;
+      var buffered = state.openBuffer;
+      state.openBuffer = [];
+      buffered.forEach(upsertMessage);
+      renderConvList();
+      renderTopbar();
+      markReadSoon();
+      if (!isTouch) input.focus();
+    }, function (err) {
+      if (state.openConv !== uid) return;
+      if (err.status === 401) { handleUnauthorized(); return; }
+      if (err.status === 404) { delete state.convs[uid]; closeConversation(); renderConvList(); return; }
+      $('empty-text').textContent = errorText(err);
+    });
+  }
+
+  function closeConversation() {
+    state.openConv = null;
+    state.openLoaded = false;
+    app.classList.remove('conv-open');
+    list.innerHTML = '';
+    renderConvList();
+  }
+
+  $('back-btn').addEventListener('click', closeConversation);
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && isAdmin() && state.openConv && document.activeElement !== input) closeConversation();
+  });
+
+  $('conv-delete').addEventListener('click', function () {
+    var c = state.convs[state.openConv];
+    if (!c) return;
+    if (!window.confirm('کل گفتگو با «' + c.name + '» برای همیشه حذف شود؟')) return;
+    api('POST', '/api/conversation/delete', { conv: c.uid }).then(function () {
+      delete state.convs[c.uid];
+      closeConversation();
+    }, function (err) {
+      if (err.status === 401) handleUnauthorized(); else window.alert(errorText(err));
+    });
+  });
+
+  // ---------- read receipts ----------
+
+  var readTimer = null;
+  function markReadSoon() {
+    clearTimeout(readTimer);
+    readTimer = setTimeout(markRead, 600);
+  }
+  function markRead() {
+    if (document.hidden || !state.token) return;
+    if (isAdmin()) {
+      var c = state.convs[state.openConv];
+      if (!c || !c.unread || !state.openLoaded) return;
+      api('POST', '/api/read', { conv: c.uid }).catch(function () {});
+    } else {
+      state.unread = 0;
+      updateTitle();
+      if (state.lastReplyId <= state.readSent) return;
+      state.readSent = state.lastReplyId;
+      api('POST', '/api/read', {}).catch(function () { state.readSent = 0; });
+    }
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) markReadSoon();
+  });
+
+  // The other side has read up to this message id.
+  function otherRead() {
+    if (isAdmin()) {
+      var c = state.convs[state.openConv];
+      return c ? c.visitorRead : 0;
+    }
+    return state.adminRead;
+  }
+
+  function updateTicks() {
+    var read = otherRead();
+    var mine = list.querySelectorAll('li.msg.mine:not(.pending)');
+    for (var i = 0; i < mine.length; i++) {
+      var li = mine[i];
+      var isRead = Number(li.getAttribute('data-id')) <= read;
+      if (li.classList.contains('read') === isRead) continue;
+      li.classList.toggle('read', isRead);
+      var meta = li.querySelector('.msg-meta');
+      meta.removeChild(meta.lastChild);
+      meta.appendChild(tickIcon(isRead));
+    }
+  }
+
+  function tickIcon(isRead) {
+    var svg = icon(isRead ? 'i-check2' : 'i-check', isRead ? 'read' : '');
+    var t = document.createElementNS(SVG_NS, 'title');
+    t.textContent = isRead ? 'خوانده شد' : 'رسید';
+    svg.appendChild(t);
+    return svg;
+  }
+
+  // ---------- rendering messages ----------
 
   function isNearBottom() {
     return list.scrollHeight - list.scrollTop - list.clientHeight < 120;
@@ -423,26 +718,29 @@
     }
   }
 
-  function isMine(m) { return !!(state.user && m.uid === state.user.uid); }
+  // "Ours" = the side of the conversation the current user is on.
+  function isOurs(m) { return isAdmin() ? m.from === 'admin' : m.from === 'visitor'; }
 
   function buildMessage(m, pending) {
-    var mine = isMine(m);
-    var li = el('li', 'msg' + (mine ? ' mine' : '') + (m.admin ? ' admin' : '') + (pending ? ' pending' : ''));
+    var ours = isOurs(m);
+    var li = el('li', 'msg' + (ours ? ' mine' : '') + (pending ? ' pending' : ''));
     li.setAttribute('data-uid', m.uid);
     li.setAttribute('data-ts', m.ts);
     if (m.id) li.setAttribute('data-id', m.id);
 
-    if (!mine) li.appendChild(makeAvatar(m));
+    if (!ours) li.appendChild(setAvatar(el('span'), m.uid, m.name));
 
     var col = el('div', 'msg-col');
     var bubble = el('div', 'bubble ' + colorClass(m.uid));
 
-    if (!mine) {
+    // Visitors see which admin answered; admins see which colleague wrote.
+    var showName = isAdmin() ? (ours && m.uid !== state.user.uid) : !ours;
+    if (showName) {
       var name = el('div', 'msg-name');
       var nameText = el('span', '', m.name);
       nameText.dir = 'auto';
       name.appendChild(nameText);
-      if (m.admin) name.appendChild(el('span', 'badge', 'مدیر'));
+      if (m.from === 'admin' && !isAdmin()) name.appendChild(el('span', 'badge', 'مدیر'));
       bubble.appendChild(name);
     }
 
@@ -454,16 +752,17 @@
     var meta = el('span', 'msg-meta');
     var time = el('time', '', formatTime(m.ts));
     time.dateTime = new Date(m.ts).toISOString();
-    time.title = new Date(m.ts).toLocaleString('fa-IR');
     meta.appendChild(time);
-    if (mine) meta.appendChild(icon(pending ? 'i-clock' : 'i-check'));
+    if (ours) {
+      var isRead = !pending && m.id <= otherRead();
+      if (isRead) li.classList.add('read');
+      meta.appendChild(pending ? icon('i-clock') : tickIcon(isRead));
+    }
     bubble.appendChild(meta);
-
     col.appendChild(bubble);
 
-    var canDelete = !pending && m.id && (mine || (state.user && state.user.admin));
     var actions = null;
-    if (canDelete) {
+    if (!pending && m.id && (isAdmin() || ours)) {
       actions = el('div', 'msg-actions');
       var del = el('button');
       del.type = 'button';
@@ -472,26 +771,32 @@
       del.appendChild(icon('i-trash'));
       del.addEventListener('click', function (e) {
         e.stopPropagation();
-        deleteMessage(m.id);
+        deleteMessage(m);
       });
       actions.appendChild(del);
       // Phones have no hover: tap the bubble to show the delete button.
       bubble.addEventListener('click', function (e) {
         if (e.target.closest('a')) return;
         var open = li.classList.contains('show-actions');
-        var shown = list.querySelectorAll('.show-actions');
-        for (var i = 0; i < shown.length; i++) shown[i].classList.remove('show-actions');
+        hideActions();
         if (!open) li.classList.add('show-actions');
       });
     }
 
-    // Order inside the row (RTL): others = avatar, bubble, actions;
-    // mine = actions, bubble (so the button sits toward the middle).
-    if (mine && actions) li.appendChild(actions);
+    // Row order (RTL): theirs = avatar, bubble, actions; ours = actions, bubble.
+    if (ours && actions) li.appendChild(actions);
     li.appendChild(col);
-    if (!mine && actions) li.appendChild(actions);
+    if (!ours && actions) li.appendChild(actions);
     return li;
   }
+
+  function hideActions() {
+    var shown = list.querySelectorAll('.show-actions');
+    for (var i = 0; i < shown.length; i++) shown[i].classList.remove('show-actions');
+  }
+  document.addEventListener('click', function (e) {
+    if (!(e.target.closest && e.target.closest('.msg'))) hideActions();
+  });
 
   // Groups consecutive messages, adds day separators and the empty state.
   function relayout() {
@@ -503,21 +808,24 @@
     for (var i = 0; i < msgs.length; i++) {
       var li = msgs[i];
       var ts = Number(li.getAttribute('data-ts'));
-      var uid = li.getAttribute('data-uid');
       var newDay = !prev || dayKey(Number(prev.getAttribute('data-ts'))) !== dayKey(ts);
       if (newDay) {
         var sep = el('li', 'day');
         sep.appendChild(el('span', '', dayLabel(ts)));
         list.insertBefore(sep, li);
       }
-      var newGroup = newDay || !prev || prev.getAttribute('data-uid') !== uid ||
+      var newGroup = newDay || prev.getAttribute('data-uid') !== li.getAttribute('data-uid') ||
         ts - Number(prev.getAttribute('data-ts')) > 5 * 60 * 1000;
       li.classList.toggle('first', newGroup);
       if (prev) prev.classList.toggle('last', newGroup);
       prev = li;
     }
     if (prev) prev.classList.add('last');
+
     $('empty').hidden = msgs.length > 0;
+    $('empty-text').textContent = isAdmin()
+      ? 'پیامی در این گفتگو نیست.'
+      : 'پیام خود را بنویسید. فقط ما آن را می‌بینیم و در اولین فرصت جواب می‌دهیم.';
   }
 
   // Inserts a confirmed message in id order, above any still-pending ones.
@@ -531,38 +839,45 @@
   }
 
   function upsertMessage(m) {
-    if (m.cid && state.pending[m.cid] && isMine(m)) dropPending(m.cid, true);
+    if (isAdmin() && m.conv !== state.openConv) return;
+    if (m.cid && state.pending[m.cid] && isOurs(m) && m.uid === state.user.uid) dropPending(m.cid, true);
+    if (!isOurs(m) && m.id > state.lastReplyId) state.lastReplyId = m.id;
     if (list.querySelector('li[data-id="' + Number(m.id) + '"]')) { relayout(); return; }
     var stick = isNearBottom();
     insertConfirmed(buildMessage(m, false), m.id);
     relayout();
-    var mine = isMine(m);
-    if (stick || mine) {
+    var ours = isOurs(m);
+    if (stick || (ours && m.uid === state.user.uid)) {
       scrollToBottom();
     } else {
       state.unseen += 1;
       renderJump();
     }
-    if (!mine && document.hidden) {
+    if (!ours && document.hidden && !isAdmin()) {
       state.unread += 1;
-      document.title = '(' + faNum(state.unread) + ') ' + state.baseTitle;
+      updateTitle();
     }
   }
 
-  function renderAll(messages) {
+  function renderAll(messages, keepScroll) {
     // Messages delivered while we were disconnected are no longer pending.
     for (var k = 0; k < messages.length; k++) {
       var m = messages[k];
-      if (m.cid && state.pending[m.cid] && isMine(m)) dropPending(m.cid, true);
+      if (m.cid && state.pending[m.cid] && m.uid === state.user.uid) dropPending(m.cid, true);
+      if (!isOurs(m) && m.id > state.lastReplyId) state.lastReplyId = m.id;
     }
-    var pendingEls = list.querySelectorAll('li.pending');
+    var scroll = list.scrollTop;
     list.innerHTML = '';
     var frag = document.createDocumentFragment();
     for (var i = 0; i < messages.length; i++) frag.appendChild(buildMessage(messages[i], false));
-    for (var j = 0; j < pendingEls.length; j++) frag.appendChild(pendingEls[j]);
+    var conv = isAdmin() ? state.openConv : null;
+    Object.keys(state.pending).forEach(function (cid) {
+      var p = state.pending[cid];
+      if (p.conv === conv) frag.appendChild(p.li);
+    });
     list.appendChild(frag);
     relayout();
-    scrollToBottom();
+    if (keepScroll) list.scrollTop = scroll; else scrollToBottom();
   }
 
   function removeMessage(id) {
@@ -574,45 +889,11 @@
     }
   }
 
-  function renderPresence(users) {
-    state.online = users;
-    var me = state.user ? state.user.uid : '';
-    users.sort(function (a, b) {
-      if ((a.uid === me) !== (b.uid === me)) return a.uid === me ? -1 : 1;
-      if (a.admin !== b.admin) return a.admin ? -1 : 1;
-      return a.name.localeCompare(b.name, 'fa');
-    });
-    $('online-count').textContent = faNum(users.length);
-    $('side-count').textContent = faNum(users.length);
-    var ul = $('online-list');
-    ul.innerHTML = '';
-    for (var i = 0; i < users.length; i++) {
-      var u = users[i];
-      var li = el('li');
-      li.appendChild(makeAvatar(u));
-      var name = el('span', 'person-name', u.name);
-      name.dir = 'auto';
-      li.appendChild(name);
-      if (u.uid === me) li.appendChild(el('span', 'person-you', 'شما'));
-      if (u.admin) li.appendChild(el('span', 'badge', 'مدیر'));
-      ul.appendChild(li);
-    }
-    renderStatus();
-  }
-
-  document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) {
-      state.unread = 0;
-      document.title = state.baseTitle;
-    }
-  });
-
-  // Tapping elsewhere hides the delete button again (phones).
-  document.addEventListener('click', function (e) {
-    if (e.target.closest && e.target.closest('.msg')) return;
-    var shown = list.querySelectorAll('.show-actions');
-    for (var i = 0; i < shown.length; i++) shown[i].classList.remove('show-actions');
-  });
+  // Day labels ("today", "yesterday") change at midnight.
+  setInterval(function () {
+    if (state.user && list.firstChild) relayout();
+    if (isAdmin()) renderConvList();
+  }, 10 * 60 * 1000);
 
   // ---------- sending ----------
 
@@ -648,18 +929,22 @@
   function submit() {
     var text = input.value.trim();
     if (!text || !state.user) return;
+    if (isAdmin() && !state.openConv) return;
     if (text.length > state.config.maxMessageLength) { window.alert(ERRORS.too_long); return; }
     input.value = '';
     autosize();
     updateSendButton();
 
     var cid = randomId();
-    var li = buildMessage({ uid: state.user.uid, name: state.user.name, admin: state.user.admin, text: text, ts: Date.now() }, true);
+    var conv = isAdmin() ? state.openConv : null;
+    var li = buildMessage({
+      uid: state.user.uid, name: state.user.name, from: isAdmin() ? 'admin' : 'visitor', text: text, ts: Date.now()
+    }, true);
     li.setAttribute('data-cid', cid);
     list.appendChild(li);
     relayout();
     scrollToBottom();
-    state.pending[cid] = { text: text, li: li, tries: 0, timer: null };
+    state.pending[cid] = { text: text, conv: conv, li: li, tries: 0, timer: null };
     trySend(cid);
   }
 
@@ -701,7 +986,10 @@
     if (!p) return;
     clearTimeout(p.timer);
     setPendingError(p, '');
-    api('POST', '/api/send', { text: p.text, cid: cid }, 20000).then(function (data) {
+    var body = { text: p.text, cid: cid };
+    if (p.conv) body.conv = p.conv;
+    api('POST', '/api/send', body, 20000).then(function (data) {
+      if (state.pending[cid]) dropPending(cid, true);
       upsertMessage(data.message);
     }, function (err) {
       if (!state.pending[cid]) return;
@@ -724,19 +1012,16 @@
     });
   }
 
-  function deleteMessage(id) {
-    if (!window.confirm('این پیام برای همه حذف شود؟')) return;
-    api('POST', '/api/delete', { id: id }).then(function () {
-      removeMessage(id);
+  function deleteMessage(m) {
+    if (!window.confirm('این پیام حذف شود؟ برای طرف مقابل هم حذف می‌شود.')) return;
+    api('POST', '/api/delete', { id: m.id, conv: m.conv }).then(function () {
+      removeMessage(m.id);
     }, function (err) {
       if (err.status === 401) handleUnauthorized();
-      else if (err.code === 'not_found') removeMessage(id);
+      else if (err.code === 'not_found') removeMessage(m.id);
       else window.alert(errorText(err));
     });
   }
-
-  // Day labels ("today", "yesterday") change at midnight.
-  setInterval(function () { if (state.user) relayout(); }, 10 * 60 * 1000);
 
   // ---------- start ----------
 
@@ -758,7 +1043,7 @@
   }
 
   loadConfig(0).then(function () {
-    if (state.token && state.user) startChat();
+    if (state.token && state.user) startApp();
     else showJoin();
   });
 })();

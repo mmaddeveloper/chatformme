@@ -55,17 +55,18 @@ async function call(method, url, body, token) {
 }
 
 // Minimal SSE reader.
-function openStream(token, since, lastEventId) {
+function openStream(token, lastEventId) {
   const events = [];
   const waiters = [];
   const headers = {};
   if (lastEventId !== undefined) headers['Last-Event-ID'] = String(lastEventId);
-  const req = http.get(BASE + '/api/stream?token=' + encodeURIComponent(token) + '&since=' + (since || 0), { headers });
+  const req = http.get(BASE + '/api/stream?token=' + encodeURIComponent(token), { headers });
   let buffer = '';
   const stream = {
     events,
     status: null,
     close() { req.destroy(); },
+    of(type) { return events.filter((e) => e.event === type); },
     next(type, timeoutMs) {
       const idx = events.findIndex((e) => e.event === type && !e.taken);
       if (idx !== -1) { events[idx].taken = true; return Promise.resolve(events[idx]); }
@@ -118,104 +119,150 @@ async function main() {
   assert.strictEqual(page.res.headers['content-encoding'], 'gzip');
   assert.ok(page.res.headers['content-security-policy'].includes("default-src 'self'"));
   assert.ok(page.body.includes('<title>تست &lt;چت&gt;</title>'));
-  assert.ok(!/https?:\/\//.test(page.body.replace('http://www.w3.org/2000/svg', '')), 'page must not load external resources');
+  assert.ok(!/https?:\/\//.test(page.body.replace(/http:\/\/www\.w3\.org\/2000\/svg/g, '')), 'page must not load external resources');
 
   const cfg = await call('GET', '/api/config');
-  assert.deepStrictEqual(
-    [cfg.data.passwordRequired, cfg.data.adminEnabled],
-    [true, true]
-  );
+  assert.deepStrictEqual([cfg.data.passwordRequired, cfg.data.adminEnabled], [true, true]);
 
-  // Joining.
+  // ---- joining ----
   assert.strictEqual((await call('POST', '/api/join', { name: 'علی', password: 'wrong' })).status, 403);
   assert.strictEqual((await call('POST', '/api/join', { name: '   ', password: 'family-pass' })).data.error, 'bad_name');
   const ali = (await call('POST', '/api/join', { name: '  علی‮  ', password: 'family-pass' })).data;
   assert.strictEqual(ali.user.name, 'علی');
   assert.strictEqual(ali.user.admin, false);
   const sara = (await call('POST', '/api/join', { name: 'سارا', password: 'family-pass' })).data;
-  const admin = (await call('POST', '/api/join', { name: 'مدیر', password: 'admin-secret' })).data;
+  const admin = (await call('POST', '/api/join', { name: 'محمد', password: 'admin-secret' })).data;
+  const admin2 = (await call('POST', '/api/join', { name: 'مریم', password: 'admin-secret' })).data;
   assert.strictEqual(admin.user.admin, true);
-
-  // Re-joining with the previous token keeps the identity.
-  const ali2 = (await call('POST', '/api/join', { name: 'علی رضا', password: 'family-pass', prevToken: ali.token })).data;
-  assert.strictEqual(ali2.user.uid, ali.user.uid);
-
   assert.strictEqual((await call('GET', '/api/me', undefined, 'bogus.token')).status, 401);
-  assert.strictEqual((await call('GET', '/api/me', undefined, ali.token)).data.user.name, 'علی');
 
-  // Streams.
+  // ---- streams ----
   const bad = openStream('nope');
   await sleep(200);
   assert.strictEqual(bad.status, 401);
   bad.close();
 
-  const s1 = openStream(sara.token);
-  const reset = await s1.next('reset');
-  assert.deepStrictEqual(reset.data.messages, []);
-  const presence = await s1.next('presence');
-  assert.ok(presence.data.some((u) => u.name === 'سارا'));
+  const sAdmin = openStream(admin.token);
+  assert.deepStrictEqual((await sAdmin.next('reset')).data.conversations, []);
+  const sAli = openStream(ali.token);
+  const aliReset = await sAli.next('reset');
+  assert.deepStrictEqual(aliReset.data, { messages: [], adminRead: 0 });
+  // Visitors only learn how many admins are online, never who the visitors are.
+  assert.deepStrictEqual((await sAli.next('presence')).data, { admins: 1 });
+  const sSara = openStream(sara.token);
+  await sSara.next('reset');
+  await sleep(400);
+  const adminPresence = sAdmin.of('presence').pop().data;
+  assert.deepStrictEqual(adminPresence.visitors.sort(), [ali.user.uid, sara.user.uid].sort());
+  assert.strictEqual(adminPresence.admins[0].name, 'محمد');
 
-  // Sending.
-  const sent = await call('POST', '/api/send', { text: 'سلام\r\nخوبی؟ ', cid: 'c1' }, ali.token);
+  // ---- a visitor writes; only admins see it ----
+  const sent = await call('POST', '/api/send', { text: 'سلام\r\nکمک لازم دارم ', cid: 'c1', conv: sara.user.uid }, ali.token);
   assert.strictEqual(sent.status, 200);
-  assert.strictEqual(sent.data.message.text, 'سلام\nخوبی؟');
-  const got = await s1.next('msg');
-  assert.strictEqual(got.data.id, sent.data.message.id);
-  assert.strictEqual(got.id, String(sent.data.message.id));
+  assert.strictEqual(sent.data.message.text, 'سلام\nکمک لازم دارم');
+  // A visitor cannot write into someone else's conversation.
+  assert.strictEqual(sent.data.message.conv, ali.user.uid);
+  assert.strictEqual(sent.data.message.from, 'visitor');
+
+  const adminGot = await sAdmin.next('msg');
+  assert.strictEqual(adminGot.data.message.id, sent.data.message.id);
+  assert.strictEqual(adminGot.data.summary.unread, 1);
+  assert.strictEqual(adminGot.data.summary.name, 'علی');
+  const aliEcho = await sAli.next('msg');
+  assert.deepStrictEqual(Object.keys(aliEcho.data), ['message']);
 
   // Retrying with the same cid does not create a duplicate.
-  const retry = await call('POST', '/api/send', { text: 'سلام\nخوبی؟', cid: 'c1' }, ali.token);
+  const retry = await call('POST', '/api/send', { text: 'سلام\nکمک لازم دارم', cid: 'c1' }, ali.token);
   assert.strictEqual(retry.data.message.id, sent.data.message.id);
+
+  const saraMsg = await call('POST', '/api/send', { text: 'من سارا هستم' }, sara.token);
+  await sAdmin.next('msg');
   await sleep(150);
-  assert.strictEqual(s1.events.filter((e) => e.event === 'msg').length, 1);
+  assert.ok(!sSara.of('msg').some((e) => e.data.message.conv !== sara.user.uid), 'Sara must not see Ali');
+  assert.ok(!sAli.of('msg').some((e) => e.data.message.conv !== ali.user.uid), 'Ali must not see Sara');
 
   assert.strictEqual((await call('POST', '/api/send', { text: '   ' }, ali.token)).data.error, 'empty');
   assert.strictEqual((await call('POST', '/api/send', { text: 'x'.repeat(2001) }, ali.token)).data.error, 'too_long');
   assert.strictEqual((await call('POST', '/api/send', { text: 'hi' })).status, 401);
 
-  // Rate limit: 5 messages per 5 seconds per user (1 already sent).
+  // ---- admin inbox and replies ----
+  assert.strictEqual((await call('GET', '/api/conversation?conv=' + ali.user.uid, undefined, ali.token)).status, 403);
+  const convAli = await call('GET', '/api/conversation?conv=' + ali.user.uid, undefined, admin.token);
+  assert.strictEqual(convAli.status, 200);
+  assert.deepStrictEqual(convAli.data.messages.map((m) => m.id), [sent.data.message.id]);
+
+  assert.strictEqual((await call('POST', '/api/send', { text: 'hi', conv: 'nobody' }, admin.token)).status, 404);
+  const reply = await call('POST', '/api/send', { text: 'سلام علی، الان کمکت می‌کنیم', conv: ali.user.uid }, admin.token);
+  assert.strictEqual(reply.data.message.from, 'admin');
+  const aliReply = await sAli.next('msg');
+  assert.strictEqual(aliReply.data.message.id, reply.data.message.id);
+  await sleep(150);
+  assert.ok(!sSara.of('msg').some((e) => e.data.message.id === reply.data.message.id), 'Sara must not see the reply to Ali');
+  // Replying marks the conversation as read for admins.
+  assert.strictEqual((await sAdmin.next('msg')).data.summary.unread, 0);
+
+  // ---- read receipts ----
+  await call('POST', '/api/read', {}, ali.token);
+  const visitorRead = await sAdmin.next('read');
+  assert.strictEqual(visitorRead.data.visitorRead, reply.data.message.id);
+  await call('POST', '/api/read', { conv: sara.user.uid }, admin2.token);
+  const saraRead = await sSara.next('read');
+  assert.deepStrictEqual(saraRead.data, { adminRead: saraMsg.data.message.id });
+  assert.strictEqual((await sAdmin.next('read')).data.summary.unread, 0);
+
+  // ---- rate limit: 5 messages per 5 seconds per visitor (1 already sent) ----
   const statuses = [];
   for (let i = 0; i < 5; i++) statuses.push((await call('POST', '/api/send', { text: 'm' + i }, sara.token)).status);
-  assert.deepStrictEqual(statuses, [200, 200, 200, 200, 200]);
-  assert.strictEqual((await call('POST', '/api/send', { text: 'spam' }, sara.token)).status, 429);
+  assert.deepStrictEqual(statuses, [200, 200, 200, 200, 429]);
 
-  // Deleting: own message yes, other people's no, admin yes.
-  const saraMsgId = s1.events.filter((e) => e.event === 'msg').pop().data.id;
-  assert.strictEqual((await call('POST', '/api/delete', { id: saraMsgId }, ali.token)).status, 403);
-  assert.strictEqual((await call('POST', '/api/delete', { id: saraMsgId }, sara.token)).status, 200);
-  const delEv = await s1.next('delete');
-  assert.strictEqual(delEv.data.id, saraMsgId);
-  assert.strictEqual((await call('POST', '/api/delete', { id: sent.data.message.id }, admin.token)).status, 200);
-  assert.strictEqual((await call('POST', '/api/delete', { id: 99999 }, admin.token)).status, 404);
+  // ---- deleting ----
+  assert.strictEqual((await call('POST', '/api/delete', { id: reply.data.message.id }, ali.token)).status, 403);
+  assert.strictEqual((await call('POST', '/api/delete', { id: saraMsg.data.message.id }, ali.token)).status, 404);
+  assert.strictEqual((await call('POST', '/api/delete', { id: sent.data.message.id }, ali.token)).status, 200);
+  assert.deepStrictEqual((await sAli.next('delete')).data, { id: sent.data.message.id });
+  const adminDel = await sAdmin.next('delete');
+  assert.strictEqual(adminDel.data.conv, ali.user.uid);
+  assert.strictEqual((await call('POST', '/api/delete', { id: reply.data.message.id, conv: ali.user.uid }, admin.token)).status, 200);
 
-  // Reconnecting with Last-Event-ID only replays what was missed.
-  const lastId = Number(delEv.id);
-  s1.close();
-  const missed = await call('POST', '/api/send', { text: 'while you were away', cid: 'c2' }, admin.token);
-  const s2 = openStream(sara.token, 0, lastId);
-  const replay = [];
-  replay.push(await s2.next('delete'));
-  replay.push(await s2.next('msg'));
-  assert.strictEqual(replay[1].data.id, missed.data.message.id);
-  assert.ok(!s2.events.some((e) => e.event === 'reset'), 'should not resend full history');
-  s2.close();
+  // ---- reconnecting only replays what was missed (and only this visitor's) ----
+  const lastId = Number(sAli.events.filter((e) => e.id).pop().id);
+  sAli.close();
+  const missed = await call('POST', '/api/send', { text: 'وقتی نبودی', conv: ali.user.uid }, admin.token);
+  await call('POST', '/api/send', { text: 'not for ali', conv: sara.user.uid }, admin.token);
+  const sAli2 = openStream(ali.token, lastId);
+  const replayed = await sAli2.next('msg');
+  assert.strictEqual(replayed.data.message.id, missed.data.message.id);
+  await sleep(150);
+  assert.ok(!sAli2.of('reset').length, 'should not resend everything');
+  assert.strictEqual(sAli2.of('msg').length, 1);
+
+  // ---- deleting a whole conversation ----
+  assert.strictEqual((await call('POST', '/api/conversation/delete', { conv: ali.user.uid }, ali.token)).status, 403);
+  assert.strictEqual((await call('POST', '/api/conversation/delete', { conv: ali.user.uid }, admin.token)).status, 200);
+  await sAli2.next('convdelete');
+  assert.strictEqual((await sAdmin.next('convdelete')).data.conv, ali.user.uid);
+  sAli2.close();
 
   // POST without JSON content type is refused (no cross-site form posts).
   const form = await fetch(BASE + '/api/send', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{}' });
   assert.strictEqual(form.status, 415);
 
-  // Persistence across a restart.
+  // ---- persistence across a restart ----
+  sAdmin.close();
+  sSara.close();
   await stopServer();
-  const saved = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'messages.json'), 'utf8'));
   await startServer();
-  const s3 = openStream(sara.token);
-  const reset2 = await s3.next('reset');
-  assert.deepStrictEqual(reset2.data.messages.map((m) => m.id), saved.messages.map((m) => m.id));
-  assert.ok(reset2.data.messages.some((m) => m.text === 'while you were away'));
-  assert.ok(!reset2.data.messages.some((m) => m.id === saraMsgId), 'deleted message must stay deleted');
-  // Tokens survive a restart (secret is stored in the data dir).
+  const sAdmin2 = openStream(admin.token);
+  const reset2 = await sAdmin2.next('reset');
+  assert.deepStrictEqual(reset2.data.conversations.map((c) => c.uid), [sara.user.uid]);
+  const sSara2 = openStream(sara.token);
+  const saraReset = await sSara2.next('reset');
+  assert.ok(saraReset.data.messages.some((m) => m.text === 'not for ali'));
+  assert.ok(saraReset.data.messages.every((m) => m.conv === sara.user.uid));
+  // Tokens survive a restart (the signing secret is stored in the data dir).
   assert.strictEqual((await call('GET', '/api/me', undefined, sara.token)).status, 200);
-  s3.close();
+  sAdmin2.close();
+  sSara2.close();
 
   await stopServer();
   console.log('All smoke tests passed.');

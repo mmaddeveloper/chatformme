@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 'use strict';
 
-// A tiny, dependency-free chat server meant to keep working when the
+// A tiny, dependency-free "message us" site meant to keep working when the
 // international internet is cut: no npm packages, no CDNs, no external fonts.
+//
+// Visitors pick a name and get a private conversation with the site's admins.
+// Visitors never see each other. Admins (anyone who logs in with ADMIN_KEY)
+// share one inbox with every conversation and can reply.
+//
 // Run it with `node server.js` on a server inside the country or on any
 // machine in a local network.
 
@@ -26,11 +31,12 @@ function intEnv(name, fallback) {
 const config = {
   port: intEnv('PORT', 3000),
   host: process.env.HOST || '0.0.0.0',
-  title: (process.env.CHAT_TITLE || 'گفتگو').slice(0, 80),
+  title: (process.env.CHAT_TITLE || 'ارتباط با ما').slice(0, 80),
   password: process.env.CHAT_PASSWORD || '',
   adminKey: process.env.ADMIN_KEY || '',
   dataDir: path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data')),
-  maxHistory: intEnv('MAX_HISTORY', 300),
+  maxHistory: intEnv('MAX_HISTORY', 300),          // messages kept per conversation
+  maxConversations: intEnv('MAX_CONVERSATIONS', 1000),
   maxMessageLength: 2000,
   maxNameLength: 32,
   maxClients: intEnv('MAX_CLIENTS', 1000),
@@ -42,7 +48,7 @@ const config = {
 
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const PING_INTERVAL_MS = 25 * 1000;
-const EVENT_LOG_MAX = 1000;
+const EVENT_LOG_MAX = 2000;
 
 if (config.password && config.adminKey && config.password === config.adminKey) {
   console.error('CHAT_PASSWORD and ADMIN_KEY must be different.');
@@ -50,22 +56,33 @@ if (config.password && config.adminKey && config.password === config.adminKey) {
 }
 
 // ---------------------------------------------------------------------------
-// Storage: messages are kept in memory and saved to a JSON file.
+// Storage: conversations are kept in memory and saved to a JSON file.
 // ---------------------------------------------------------------------------
 
-const DATA_FILE = path.join(config.dataDir, 'messages.json');
+const DATA_FILE = path.join(config.dataDir, 'conversations.json');
 const SECRET_FILE = path.join(config.dataDir, 'secret.key');
 
 fs.mkdirSync(config.dataDir, { recursive: true });
 
-let state = { seq: 0, messages: [] };
+// state.convs: visitor uid -> { uid, name, created, messages: [], adminRead, visitorRead }
+// adminRead / visitorRead: id of the last message each side has seen.
+let state = { seq: 0, convs: {} };
 try {
   const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  if (!raw || !Array.isArray(raw.messages)) throw new Error('unexpected format');
-  state = {
-    seq: Number(raw.seq) || 0,
-    messages: raw.messages.slice(-config.maxHistory),
-  };
+  if (!raw || typeof raw.convs !== 'object' || !raw.convs) throw new Error('unexpected format');
+  state.seq = Number(raw.seq) || 0;
+  for (const uid of Object.keys(raw.convs)) {
+    const c = raw.convs[uid];
+    if (!c || !Array.isArray(c.messages)) continue;
+    state.convs[uid] = {
+      uid: uid,
+      name: String(c.name || ''),
+      created: Number(c.created) || Date.now(),
+      messages: c.messages.slice(-config.maxHistory),
+      adminRead: Number(c.adminRead) || 0,
+      visitorRead: Number(c.visitorRead) || 0,
+    };
+  }
 } catch (err) {
   if (err.code !== 'ENOENT') {
     // Never silently overwrite a file we could not read.
@@ -95,14 +112,6 @@ function saveNow() {
   } catch (err) {
     console.error('Saving messages failed:', err.message);
   }
-}
-
-// Recent events (new/deleted messages) so a client that reconnects after a
-// short drop only receives what it missed instead of the whole history.
-const eventLog = [];
-function logEvent(ev) {
-  eventLog.push(ev);
-  if (eventLog.length > EVENT_LOG_MAX) eventLog.shift();
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +212,7 @@ function makeLimiter(max, windowMs) {
 }
 
 const joinLimiter = makeLimiter(20, 60 * 1000);      // per IP
-const sendLimiterUser = makeLimiter(5, 5 * 1000);    // per user
+const sendLimiterUser = makeLimiter(5, 5 * 1000);    // per visitor
 const sendLimiterIp = makeLimiter(30, 10 * 1000);    // per IP (mobile carriers share IPs)
 
 // Remembers recent client message ids so a retried send is not duplicated.
@@ -214,10 +223,81 @@ function rememberCid(key, msg) {
 }
 
 // ---------------------------------------------------------------------------
+// Conversations
+// ---------------------------------------------------------------------------
+
+function lastActivity(conv) {
+  const last = conv.messages[conv.messages.length - 1];
+  return last ? last.ts : conv.created;
+}
+
+// What the admin inbox shows for one conversation.
+function summary(conv) {
+  const last = conv.messages[conv.messages.length - 1] || null;
+  let unread = 0;
+  for (let i = conv.messages.length - 1; i >= 0; i--) {
+    const m = conv.messages[i];
+    if (m.id <= conv.adminRead) break;
+    if (m.from === 'visitor') unread += 1;
+  }
+  return {
+    uid: conv.uid,
+    name: conv.name,
+    lastTs: lastActivity(conv),
+    last: last ? { text: last.text.slice(0, 140), from: last.from } : null,
+    unread: unread,
+    adminRead: conv.adminRead,
+    visitorRead: conv.visitorRead,
+  };
+}
+
+function createConv(user) {
+  const conv = { uid: user.uid, name: user.name, created: Date.now(), messages: [], adminRead: 0, visitorRead: 0 };
+  state.convs[user.uid] = conv;
+  // Keep storage bounded: drop the conversation that has been quiet the longest.
+  const uids = Object.keys(state.convs);
+  if (uids.length > config.maxConversations) {
+    let oldest = null;
+    for (const uid of uids) {
+      if (uid === user.uid) continue;
+      if (!oldest || lastActivity(state.convs[uid]) < lastActivity(state.convs[oldest])) oldest = uid;
+    }
+    if (oldest) removeConv(oldest);
+  }
+  return conv;
+}
+
+function removeConv(uid) {
+  delete state.convs[uid];
+  state.seq += 1;
+  emit({ seq: state.seq, type: 'convdelete', conv: uid, data: { conv: uid } });
+  scheduleSave();
+}
+
+function addMessage(conv, user, text, cid) {
+  state.seq += 1;
+  const from = user.admin ? 'admin' : 'visitor';
+  const msg = { id: state.seq, conv: conv.uid, from: from, uid: user.uid, name: user.name, text: text, ts: Date.now() };
+  if (cid) msg.cid = cid;
+  conv.messages.push(msg);
+  if (conv.messages.length > config.maxHistory) conv.messages.splice(0, conv.messages.length - config.maxHistory);
+  // Whoever writes has obviously seen the conversation.
+  if (from === 'admin') conv.adminRead = msg.id;
+  else { conv.visitorRead = msg.id; conv.name = user.name; }
+  emit({ seq: msg.id, type: 'msg', conv: conv.uid, data: { message: msg, summary: summary(conv) } });
+  scheduleSave();
+  return msg;
+}
+
+// ---------------------------------------------------------------------------
 // Live clients (Server-Sent Events)
 // ---------------------------------------------------------------------------
 
 const clients = new Set();
+
+// Recent events so a client that reconnects after a short drop only receives
+// what it missed instead of everything.
+const eventLog = [];
 
 function sseWrite(res, event, data, id) {
   let out = '';
@@ -226,65 +306,91 @@ function sseWrite(res, event, data, id) {
   out += 'data: ' + JSON.stringify(data) + '\n\n';
   res.write(out);
 }
-function broadcast(event, data, id) {
-  for (const c of clients) sseWrite(c.res, event, data, id);
+
+// Admins see every event in full. A visitor only sees events about their own
+// conversation, and only the parts meant for them.
+function payloadFor(client, ev) {
+  if (client.user.admin) return ev.data;
+  if (ev.conv !== client.user.uid) return null;
+  if (ev.type === 'msg') return { message: ev.data.message };
+  if (ev.type === 'delete') return { id: ev.data.id };
+  if (ev.type === 'read') return { adminRead: ev.data.adminRead };
+  if (ev.type === 'convdelete') return {};
+  return null;
 }
 
-function presenceList() {
-  const byUid = new Map();
+function emit(ev) {
+  eventLog.push(ev);
+  if (eventLog.length > EVENT_LOG_MAX) eventLog.shift();
   for (const c of clients) {
-    if (!byUid.has(c.user.uid)) byUid.set(c.user.uid, { uid: c.user.uid, name: c.user.name, admin: c.user.admin });
+    const data = payloadFor(c, ev);
+    if (data) sseWrite(c.res, ev.type, data, ev.seq);
   }
-  return Array.from(byUid.values());
-}
-let presenceTimer = null;
-function schedulePresence() {
-  if (presenceTimer) return;
-  presenceTimer = setTimeout(() => {
-    presenceTimer = null;
-    broadcast('presence', presenceList());
-  }, 300);
 }
 
-setInterval(() => broadcast('ping', Date.now()), PING_INTERVAL_MS).unref();
-
-function addMessage(user, text, cid) {
-  state.seq += 1;
-  const msg = { id: state.seq, uid: user.uid, name: user.name, admin: user.admin, text: text, ts: Date.now() };
-  if (cid) msg.cid = cid;
-  state.messages.push(msg);
-  if (state.messages.length > config.maxHistory) {
-    state.messages.splice(0, state.messages.length - config.maxHistory);
+function resetPayload(client) {
+  if (client.user.admin) {
+    const list = Object.keys(state.convs).map((uid) => summary(state.convs[uid]));
+    list.sort((a, b) => b.lastTs - a.lastTs);
+    return { conversations: list };
   }
-  logEvent({ seq: msg.id, type: 'msg', data: msg });
-  scheduleSave();
-  broadcast('msg', msg, msg.id);
-  return msg;
+  const conv = state.convs[client.user.uid];
+  return { messages: conv ? conv.messages : [], adminRead: conv ? conv.adminRead : 0 };
 }
 
-function deleteMessage(id) {
-  const idx = state.messages.findIndex((m) => m.id === id);
-  if (idx === -1) return false;
-  state.messages.splice(idx, 1);
-  state.seq += 1;
-  const data = { id: id };
-  logEvent({ seq: state.seq, type: 'delete', data: data });
-  scheduleSave();
-  broadcast('delete', data, state.seq);
-  return true;
-}
-
-function sendInitial(res, since) {
+function sendInitial(client, since) {
   const firstLogged = eventLog.length ? eventLog[0].seq : state.seq + 1;
   const canReplay = since > 0 && since <= state.seq && since >= firstLogged - 1;
   if (canReplay) {
     for (const ev of eventLog) {
-      if (ev.seq > since) sseWrite(res, ev.type, ev.data, ev.seq);
+      if (ev.seq <= since) continue;
+      const data = payloadFor(client, ev);
+      if (data) sseWrite(client.res, ev.type, data, ev.seq);
     }
+    sseWrite(client.res, 'ping', Date.now(), state.seq);
   } else {
-    sseWrite(res, 'reset', { messages: state.messages }, state.seq);
+    sseWrite(client.res, 'reset', resetPayload(client), state.seq);
   }
 }
+
+// Who is online. Admins learn which visitors are online; visitors only learn
+// how many admins are online.
+function presence() {
+  const admins = new Map();
+  const visitors = new Set();
+  for (const c of clients) {
+    if (c.user.admin) admins.set(c.user.uid, c.user.name);
+    else visitors.add(c.user.uid);
+  }
+  return {
+    admins: Array.from(admins, (entry) => ({ uid: entry[0], name: entry[1] })),
+    visitors: Array.from(visitors),
+  };
+}
+function presenceFor(client, p) {
+  return client.user.admin ? p : { admins: p.admins.length };
+}
+
+let presenceTimer = null;
+let lastAdminCount = -1;
+function schedulePresence() {
+  if (presenceTimer) return;
+  presenceTimer = setTimeout(() => {
+    presenceTimer = null;
+    const p = presence();
+    const adminCountChanged = p.admins.length !== lastAdminCount;
+    lastAdminCount = p.admins.length;
+    for (const c of clients) {
+      if (c.user.admin || adminCountChanged) sseWrite(c.res, 'presence', presenceFor(c, p));
+    }
+  }, 300);
+}
+
+// The ping carries the current sequence number so every client's position
+// moves forward even when the events in between were not meant for it.
+setInterval(() => {
+  for (const c of clients) sseWrite(c.res, 'ping', Date.now(), state.seq);
+}, PING_INTERVAL_MS).unref();
 
 // ---------------------------------------------------------------------------
 // Static files (served from memory, gzip-compressed once at startup)
@@ -327,6 +433,8 @@ function fontFaceCss() {
   return css;
 }
 
+const staticFiles = new Map();
+
 function loadStaticDir(dir, prefix) {
   for (const name of fs.readdirSync(dir)) {
     const full = path.join(dir, name);
@@ -355,7 +463,6 @@ function loadStaticDir(dir, prefix) {
   }
 }
 
-const staticFiles = new Map();
 loadStaticDir(PUBLIC_DIR, '');
 staticFiles.set('/', staticFiles.get('/index.html'));
 
@@ -453,13 +560,15 @@ async function handleJoin(req, res) {
   if (config.adminKey && pw && safeEqual(pw, config.adminKey)) {
     admin = true;
   } else if (config.password ? !safeEqual(pw, config.password) : pw !== '') {
-    // With no chat password, a non-empty password can only be an admin attempt.
+    // With no site password, a non-empty password can only be an admin attempt.
     return sendJson(res, 403, { error: 'bad_password' });
   }
 
-  // Keep the same identity when re-joining (e.g. after changing the name).
+  // Keep the same identity (and so the same conversation) when re-joining.
   const prev = verifyToken(body.prevToken);
   const user = { uid: prev ? prev.uid : randomId(12), name: name, admin: admin };
+  const conv = !admin && state.convs[user.uid];
+  if (conv && conv.name !== name) { conv.name = name; scheduleSave(); }
   sendJson(res, 200, { token: makeToken(user), user: user });
 }
 
@@ -475,10 +584,18 @@ async function handleSend(req, res) {
   const cidKey = user.uid + ':' + cid;
   if (cid && recentCids.has(cidKey)) return sendJson(res, 200, { message: recentCids.get(cidKey) });
 
-  if (!sendLimiterUser(user.uid) || !sendLimiterIp(clientIp(req))) {
+  // Admins reply to an existing conversation; visitors always write to their own.
+  let conv = null;
+  if (user.admin) {
+    conv = state.convs[String(body.conv)];
+    if (!conv) return sendJson(res, 404, { error: 'not_found' });
+  }
+  if ((!user.admin && !sendLimiterUser(user.uid)) || !sendLimiterIp(clientIp(req))) {
     return sendJson(res, 429, { error: 'rate_limited' });
   }
-  const msg = addMessage(user, text, cid);
+  if (!conv) conv = state.convs[user.uid] || createConv(user);
+
+  const msg = addMessage(conv, user, text, cid);
   if (cid) rememberCid(cidKey, msg);
   sendJson(res, 200, { message: msg });
 }
@@ -487,12 +604,58 @@ async function handleDelete(req, res) {
   const user = verifyToken(bearer(req));
   if (!user) return sendJson(res, 401, { error: 'unauthorized' });
   const body = await readJson(req);
+  const conv = state.convs[user.admin ? String(body.conv) : user.uid];
   const id = Number(body.id);
-  const msg = state.messages.find((m) => m.id === id);
-  if (!msg) return sendJson(res, 404, { error: 'not_found' });
-  if (!user.admin && msg.uid !== user.uid) return sendJson(res, 403, { error: 'forbidden' });
-  deleteMessage(id);
+  const idx = conv ? conv.messages.findIndex((m) => m.id === id) : -1;
+  if (idx === -1) return sendJson(res, 404, { error: 'not_found' });
+  // Visitors may delete their own messages; admins may delete any message.
+  if (!user.admin && conv.messages[idx].from !== 'visitor') return sendJson(res, 403, { error: 'forbidden' });
+
+  conv.messages.splice(idx, 1);
+  state.seq += 1;
+  emit({ seq: state.seq, type: 'delete', conv: conv.uid, data: { id: id, conv: conv.uid, summary: summary(conv) } });
+  scheduleSave();
   sendJson(res, 200, { ok: true });
+}
+
+async function handleRead(req, res) {
+  const user = verifyToken(bearer(req));
+  if (!user) return sendJson(res, 401, { error: 'unauthorized' });
+  const body = await readJson(req);
+  const conv = state.convs[user.admin ? String(body.conv) : user.uid];
+  if (!conv) return sendJson(res, 200, { ok: true });
+  const last = conv.messages.length ? conv.messages[conv.messages.length - 1].id : 0;
+  const field = user.admin ? 'adminRead' : 'visitorRead';
+  if (last > conv[field]) {
+    conv[field] = last;
+    state.seq += 1;
+    emit({
+      seq: state.seq, type: 'read', conv: conv.uid,
+      data: { conv: conv.uid, adminRead: conv.adminRead, visitorRead: conv.visitorRead, summary: summary(conv) },
+    });
+    scheduleSave();
+  }
+  sendJson(res, 200, { ok: true });
+}
+
+async function handleDeleteConversation(req, res) {
+  const user = verifyToken(bearer(req));
+  if (!user) return sendJson(res, 401, { error: 'unauthorized' });
+  if (!user.admin) return sendJson(res, 403, { error: 'forbidden' });
+  const body = await readJson(req);
+  const uid = String(body.conv);
+  if (!state.convs[uid]) return sendJson(res, 404, { error: 'not_found' });
+  removeConv(uid);
+  sendJson(res, 200, { ok: true });
+}
+
+function handleGetConversation(req, res, url) {
+  const user = verifyToken(bearer(req));
+  if (!user) return sendJson(res, 401, { error: 'unauthorized' });
+  if (!user.admin) return sendJson(res, 403, { error: 'forbidden' });
+  const conv = state.convs[String(url.searchParams.get('conv'))];
+  if (!conv) return sendJson(res, 404, { error: 'not_found' });
+  return sendJson(res, 200, { summary: summary(conv), messages: conv.messages });
 }
 
 function handleStream(req, res, url) {
@@ -523,8 +686,8 @@ function handleStream(req, res, url) {
   // the page passes the last id it saw in `since`.
   const header = req.headers['last-event-id'];
   const since = parseInt(header !== undefined ? header : url.searchParams.get('since'), 10) || 0;
-  sendInitial(res, since);
-  sseWrite(res, 'presence', presenceList());
+  sendInitial(client, since);
+  sseWrite(res, 'presence', presenceFor(client, presence()));
   schedulePresence();
 
   const cleanup = () => {
@@ -557,6 +720,7 @@ async function handle(req, res) {
       const user = verifyToken(bearer(req));
       return user ? sendJson(res, 200, { user: user }) : sendJson(res, 401, { error: 'unauthorized' });
     }
+    if (p === '/api/conversation') return handleGetConversation(req, res, url);
     if (p === '/api/stream') return handleStream(req, res, url);
     if (serveStatic(req, res, p)) return undefined;
     return sendJson(res, 404, { error: 'not_found' });
@@ -569,6 +733,8 @@ async function handle(req, res) {
     if (p === '/api/join') return handleJoin(req, res);
     if (p === '/api/send') return handleSend(req, res);
     if (p === '/api/delete') return handleDelete(req, res);
+    if (p === '/api/read') return handleRead(req, res);
+    if (p === '/api/conversation/delete') return handleDeleteConversation(req, res);
     return sendJson(res, 404, { error: 'not_found' });
   }
 
@@ -608,8 +774,8 @@ server.listen(config.port, config.host, () => {
   } else {
     console.log('  ' + proto + '://' + config.host + ':' + config.port);
   }
-  if (!config.password) console.log('Note: CHAT_PASSWORD is not set, so anyone who can reach this address can join.');
-  if (!config.adminKey) console.log('Note: ADMIN_KEY is not set, so nobody can delete other people\'s messages.');
+  if (!config.adminKey) console.log('WARNING: ADMIN_KEY is not set, so nobody can read or answer messages. Set ADMIN_KEY.');
+  if (!config.password) console.log('Note: CHAT_PASSWORD is not set, so anyone who can reach this address can send you messages.');
   if (!useTls) console.log('Note: running without HTTPS; traffic is not encrypted (see README).');
 });
 
