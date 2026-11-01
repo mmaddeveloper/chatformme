@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#0f766e">
+<meta name="referrer" content="no-referrer">
+<title>__CHAT_TITLE__</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230f766e'/%3E%3Cpath d='M16 20h32a4 4 0 0 1 4 4v14a4 4 0 0 1-4 4H30l-9 7v-7h-5a4 4 0 0 1-4-4V24a4 4 0 0 1 4-4z' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+
+<main id="join" class="join" hidden>
+  <form id="join-form" class="card" novalidate>
+    <h1 class="join-title">__CHAT_TITLE__</h1>
+    <p class="muted">برای ورود به گفتگو یک نام انتخاب کنید.</p>
+
+    <label for="name">نام شما</label>
+    <input id="name" name="name" maxlength="32" autocomplete="nickname" dir="auto" required>
+
+    <div id="password-row" hidden>
+      <label for="password" id="password-label">رمز ورود</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" dir="ltr">
+    </div>
+
+    <p id="join-error" class="error" role="alert" hidden></p>
+
+    <button type="submit" id="join-btn" class="primary">ورود به گفتگو</button>
+    <button type="button" id="admin-toggle" class="link" hidden>ورود مدیر</button>
+  </form>
+</main>
+
+<div id="chat" class="chat" hidden>
+  <header class="bar">
+    <div class="bar-title">
+      <h1 id="chat-title">__CHAT_TITLE__</h1>
+      <span id="status" class="status" data-state="connecting"><i aria-hidden="true"></i><span id="status-text">در حال اتصال…</span></span>
+    </div>
+    <button type="button" id="online-btn" class="chip" aria-expanded="false" aria-controls="online-panel">
+      آنلاین: <b id="online-count">۰</b>
+    </button>
+    <button type="button" id="logout-btn" class="chip ghost">خروج</button>
+  </header>
+
+  <div id="online-panel" class="online-panel" hidden>
+    <ul id="online-list"></ul>
+  </div>
+
+  <div class="messages-wrap">
+    <ul id="messages" class="messages" role="log" aria-label="پیام‌ها"></ul>
+    <button type="button" id="jump" class="jump" hidden>پیام جدید ↓</button>
+  </div>
+
+  <form id="composer" class="composer">
+    <textarea id="input" rows="1" maxlength="2000" dir="auto" placeholder="پیام خود را بنویسید…" aria-label="متن پیام"></textarea>
+    <button type="submit" id="send-btn" class="primary">ارسال</button>
+  </form>
+</div>
+
+<noscript><p class="noscript">برای استفاده از این چت باید جاوااسکریپت مرورگر فعال باشد.</p></noscript>
+</body>
+</html>
