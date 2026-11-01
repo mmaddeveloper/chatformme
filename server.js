@@ -306,23 +306,57 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-const staticFiles = new Map();
-for (const name of fs.readdirSync(PUBLIC_DIR)) {
-  const full = path.join(PUBLIC_DIR, name);
-  if (!fs.statSync(full).isFile()) continue;
-  const ext = path.extname(name).toLowerCase();
-  let body = fs.readFileSync(full);
-  if (name === 'index.html') {
-    body = Buffer.from(body.toString('utf8').replace(/__CHAT_TITLE__/g, escapeHtml(config.title)));
+// Optional bundled font: drop Vazirmatn .woff2 files into public/fonts/ and the
+// matching @font-face rules are added to style.css automatically.
+const FONT_WEIGHTS = {
+  Thin: '100', ExtraLight: '200', Light: '300', Regular: '400', Medium: '500',
+  SemiBold: '600', Bold: '700', ExtraBold: '800', Black: '900', Variable: '100 900',
+};
+function fontFaceCss() {
+  let names = [];
+  try { names = fs.readdirSync(path.join(PUBLIC_DIR, 'fonts')); } catch (e) { return ''; }
+  let css = '';
+  for (const name of names.sort()) {
+    const m = /^Vazirmatn(?:-(\w+)|\[wght\])\.woff2$/.exec(name);
+    if (!m) continue;
+    const weight = m[1] ? FONT_WEIGHTS[m[1]] : FONT_WEIGHTS.Variable;
+    if (!weight) continue;
+    css += '@font-face{font-family:"Vazirmatn";src:url("/fonts/' + encodeURIComponent(name) +
+      '") format("woff2");font-weight:' + weight + ';font-style:normal;font-display:swap}\n';
   }
-  const compressible = /^(text\/|application\/(javascript|json)|image\/svg)/.test(MIME[ext] || '');
-  staticFiles.set('/' + name, {
-    body: body,
-    gz: compressible ? zlib.gzipSync(body, { level: 9 }) : null,
-    type: MIME[ext] || 'application/octet-stream',
-    etag: '"' + crypto.createHash('sha1').update(body).digest('hex').slice(0, 16) + '"',
-  });
+  return css;
 }
+
+function loadStaticDir(dir, prefix) {
+  for (const name of fs.readdirSync(dir)) {
+    const full = path.join(dir, name);
+    const stat = fs.statSync(full);
+    if (stat.isDirectory()) {
+      if (!prefix && name === 'fonts') loadStaticDir(full, '/fonts');
+      continue;
+    }
+    if (!stat.isFile() || name.startsWith('.')) continue;
+    const ext = path.extname(name).toLowerCase();
+    let body = fs.readFileSync(full);
+    if (!prefix && name === 'index.html') {
+      body = Buffer.from(body.toString('utf8').replace(/__CHAT_TITLE__/g, escapeHtml(config.title)));
+    }
+    if (!prefix && name === 'style.css') {
+      body = Buffer.concat([Buffer.from(fontFaceCss()), body]);
+    }
+    const compressible = /^(text\/|application\/(javascript|json)|image\/svg)/.test(MIME[ext] || '');
+    staticFiles.set((prefix || '') + '/' + name, {
+      body: body,
+      gz: compressible ? zlib.gzipSync(body, { level: 9 }) : null,
+      type: MIME[ext] || 'application/octet-stream',
+      etag: '"' + crypto.createHash('sha1').update(body).digest('hex').slice(0, 16) + '"',
+      cache: prefix === '/fonts' ? 'public, max-age=2592000' : 'no-cache',
+    });
+  }
+}
+
+const staticFiles = new Map();
+loadStaticDir(PUBLIC_DIR, '');
 staticFiles.set('/', staticFiles.get('/index.html'));
 
 const SECURITY_HEADERS = {
@@ -335,11 +369,13 @@ const SECURITY_HEADERS = {
 };
 
 function serveStatic(req, res, pathname) {
-  const file = staticFiles.get(pathname);
+  let key = pathname;
+  try { key = decodeURIComponent(pathname); } catch (e) { /* keep as is */ }
+  const file = staticFiles.get(key);
   if (!file) return false;
   const headers = Object.assign({
     'Content-Type': file.type,
-    'Cache-Control': 'no-cache',
+    'Cache-Control': file.cache,
     ETag: file.etag,
     Vary: 'Accept-Encoding',
   }, SECURITY_HEADERS);

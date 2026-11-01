@@ -4,6 +4,7 @@
   // ---------- small helpers ----------
 
   var $ = function (id) { return document.getElementById(id); };
+  var SVG_NS = 'http://www.w3.org/2000/svg';
 
   var storage = {
     get: function (k) { try { return window.localStorage.getItem(k); } catch (e) { return null; } },
@@ -27,6 +28,38 @@
     try { return Number(n).toLocaleString('fa-IR'); } catch (e) { return String(n); }
   }
 
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function icon(id) {
+    var svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('aria-hidden', 'true');
+    var use = document.createElementNS(SVG_NS, 'use');
+    use.setAttribute('href', '#' + id);
+    svg.appendChild(use);
+    return svg;
+  }
+
+  // Stable color (0-7) and initial for each person.
+  function colorClass(uid) {
+    var h = 0;
+    for (var i = 0; i < uid.length; i++) h = (h * 31 + uid.charCodeAt(i)) >>> 0;
+    return 'c' + (h % 8);
+  }
+  function initial(name) {
+    var chars = Array.from(String(name).trim());
+    return chars.length ? chars[0].toUpperCase() : '?';
+  }
+  function makeAvatar(user) {
+    var a = el('span', 'avatar ' + colorClass(user.uid || ''), initial(user.name || ''));
+    a.setAttribute('aria-hidden', 'true');
+    return a;
+  }
+
   var ERRORS = {
     bad_password: 'رمز اشتباه است.',
     bad_name: 'نام باید بین ۱ تا ۳۲ حرف باشد.',
@@ -35,7 +68,7 @@
     empty: 'پیام خالی است.',
     forbidden: 'اجازهٔ این کار را ندارید.',
     not_found: 'پیام پیدا نشد (شاید قبلاً حذف شده).',
-    network: 'ارتباط با سرور برقرار نشد. اتصال اینترنت را بررسی کنید.',
+    network: 'ارتباط با سرور برقرار نشد. اتصال را بررسی کنید.',
     server_error: 'خطای سرور؛ دوباره تلاش کنید.'
   };
   function errorText(err) {
@@ -49,16 +82,32 @@
     token: storage.get('chat.token'),
     user: readJson('chat.user'),
     es: null,
+    connState: 'connecting',
+    online: [],
     lastSeq: 0,
     lastEventAt: 0,
     reconnectTimer: null,
     reconnectDelay: 2000,
     pending: {},      // cid -> { text, li, tries, timer }
-    unread: 0,
+    unread: 0,        // for the tab title
+    unseen: 0,        // for the "new messages" button
     baseTitle: document.title
   };
 
-  var isTouch = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  var isTouch = window.matchMedia && window.matchMedia('(hover: none) and (pointer: coarse)').matches;
+
+  // On phones the on-screen keyboard shrinks the visible area; size the app to it
+  // so the message box always stays visible above the keyboard (mainly iOS).
+  if (window.visualViewport) {
+    var vv = window.visualViewport;
+    var fitViewport = function () {
+      if (vv.scale > 1.01) return; // pinch-zoomed: leave the layout alone
+      document.documentElement.style.setProperty('--app-h', Math.round(vv.height) + 'px');
+      if (window.scrollY) window.scrollTo(0, 0);
+    };
+    vv.addEventListener('resize', fitViewport);
+    fitViewport();
+  }
 
   // ---------- API ----------
 
@@ -86,7 +135,7 @@
         }
         return data;
       });
-    }, function (e) {
+    }, function () {
       if (timer) clearTimeout(timer);
       var err = new Error('network');
       err.code = 'network';
@@ -98,14 +147,16 @@
 
   function showJoin(message) {
     closeStream();
+    closeDrawer();
     $('chat').hidden = true;
     $('join').hidden = false;
+    document.title = state.baseTitle;
     var lastName = storage.get('chat.name');
     if (lastName && !$('name').value) $('name').value = lastName;
     $('password-row').hidden = !state.config.passwordRequired;
     $('admin-toggle').hidden = state.config.passwordRequired || !state.config.adminEnabled;
     showJoinError(message || '');
-    setTimeout(function () { $('name').focus(); }, 0);
+    if (!isTouch) setTimeout(function () { $('name').focus(); }, 0);
   }
 
   function showJoinError(text) {
@@ -149,20 +200,33 @@
 
   var list = $('messages');
   var input = $('input');
+  var sendBtn = $('send-btn');
 
   function startChat() {
     $('join').hidden = true;
     $('chat').hidden = false;
     list.innerHTML = '';
     state.lastSeq = 0;
+    renderMe();
+    relayout();
     connect();
+    updateSendButton();
     if (!isTouch) input.focus();
+  }
+
+  function renderMe() {
+    var me = state.user;
+    var av = $('me-avatar');
+    av.className = 'avatar ' + colorClass(me.uid);
+    av.textContent = initial(me.name);
+    $('me-name').textContent = me.name;
+    $('me-role').textContent = me.admin ? 'مدیر گفتگو' : 'شما';
   }
 
   function logout() {
     closeStream();
-    var pendingIds = Object.keys(state.pending);
-    for (var i = 0; i < pendingIds.length; i++) clearTimeout(state.pending[pendingIds[i]].timer);
+    var ids = Object.keys(state.pending);
+    for (var i = 0; i < ids.length; i++) clearTimeout(state.pending[ids[i]].timer);
     state.pending = {};
     state.token = null;
     state.user = null;
@@ -181,12 +245,41 @@
     showJoinError('نشست شما منقضی شده یا رمز تغییر کرده؛ لطفاً دوباره وارد شوید.');
   }
 
+  // ---------- people drawer (phones) ----------
+
+  var app = $('chat');
+  function openDrawer() {
+    app.classList.add('drawer-open');
+    $('online-btn').setAttribute('aria-expanded', 'true');
+    $('side-close').focus();
+  }
+  function closeDrawer() {
+    if (!app.classList.contains('drawer-open')) return;
+    app.classList.remove('drawer-open');
+    $('online-btn').setAttribute('aria-expanded', 'false');
+  }
+  $('online-btn').addEventListener('click', openDrawer);
+  $('side-close').addEventListener('click', closeDrawer);
+  $('backdrop').addEventListener('click', closeDrawer);
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') closeDrawer();
+  });
+
   // ---------- connection (Server-Sent Events) ----------
 
   function setStatus(s) {
-    var el = $('status');
-    el.setAttribute('data-state', s);
-    $('status-text').textContent = s === 'online' ? 'متصل' : s === 'offline' ? 'قطع — تلاش دوباره…' : 'در حال اتصال…';
+    state.connState = s;
+    renderStatus();
+  }
+
+  function renderStatus() {
+    var s = state.connState;
+    $('status').setAttribute('data-state', s);
+    var text;
+    if (s === 'online') text = faNum(state.online.length) + ' نفر آنلاین';
+    else if (s === 'offline') text = 'اتصال قطع است؛ تلاش دوباره…';
+    else text = 'در حال اتصال…';
+    $('status-text').textContent = text;
   }
 
   function closeStream() {
@@ -270,118 +363,186 @@
   // ---------- rendering ----------
 
   function isNearBottom() {
-    return list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+    return list.scrollHeight - list.scrollTop - list.clientHeight < 120;
   }
   function scrollToBottom() {
     list.scrollTop = list.scrollHeight;
-    $('jump').hidden = true;
+    state.unseen = 0;
+    renderJump();
+  }
+  function renderJump() {
+    var show = !isNearBottom() && list.scrollHeight > list.clientHeight;
+    $('jump').hidden = !show;
+    $('jump-count').hidden = !state.unseen;
+    $('jump-count').textContent = faNum(state.unseen);
   }
   $('jump').addEventListener('click', scrollToBottom);
-  list.addEventListener('scroll', function () { if (isNearBottom()) $('jump').hidden = true; });
+  list.addEventListener('scroll', function () {
+    if (isNearBottom()) state.unseen = 0;
+    renderJump();
+  });
 
   function formatTime(ts) {
     var d = new Date(ts);
-    var now = new Date();
-    var opts = { hour: '2-digit', minute: '2-digit' };
-    if (d.toDateString() !== now.toDateString()) { opts.month = 'short'; opts.day = 'numeric'; }
-    try { return d.toLocaleString('fa-IR', opts); } catch (e) { return d.toLocaleString(); }
+    try { return d.toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' }); } catch (e) { return d.toLocaleTimeString(); }
+  }
+
+  function dayKey(ts) {
+    var d = new Date(ts);
+    return d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate();
+  }
+  function dayLabel(ts) {
+    var d = new Date(ts);
+    var today = new Date();
+    var yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+    if (dayKey(ts) === dayKey(today.getTime())) return 'امروز';
+    if (dayKey(ts) === dayKey(yesterday.getTime())) return 'دیروز';
+    try {
+      return d.toLocaleDateString('fa-IR', { weekday: 'long', day: 'numeric', month: 'long' });
+    } catch (e) {
+      return d.toDateString();
+    }
   }
 
   var URL_RE = /(https?:\/\/[^\s<>"']+)/g;
 
-  function fillText(el, text) {
+  function fillText(node, text) {
     var parts = text.split(URL_RE);
     for (var i = 0; i < parts.length; i++) {
       if (!parts[i]) continue;
       if (i % 2 === 1) {
-        var a = document.createElement('a');
+        var a = el('a', '', parts[i]);
         a.href = parts[i];
-        a.textContent = parts[i];
         a.target = '_blank';
         a.rel = 'noopener noreferrer nofollow';
         a.dir = 'ltr';
-        el.appendChild(a);
+        node.appendChild(a);
       } else {
-        el.appendChild(document.createTextNode(parts[i]));
+        node.appendChild(document.createTextNode(parts[i]));
       }
     }
   }
 
-  function buildMessage(m, opts) {
-    var mine = state.user && m.uid === state.user.uid;
-    var li = document.createElement('li');
-    li.className = 'msg' + (mine ? ' mine' : '') + (m.admin ? ' admin' : '');
+  function isMine(m) { return !!(state.user && m.uid === state.user.uid); }
+
+  function buildMessage(m, pending) {
+    var mine = isMine(m);
+    var li = el('li', 'msg' + (mine ? ' mine' : '') + (m.admin ? ' admin' : '') + (pending ? ' pending' : ''));
+    li.setAttribute('data-uid', m.uid);
+    li.setAttribute('data-ts', m.ts);
     if (m.id) li.setAttribute('data-id', m.id);
 
+    if (!mine) li.appendChild(makeAvatar(m));
+
+    var col = el('div', 'msg-col');
+    var bubble = el('div', 'bubble ' + colorClass(m.uid));
+
     if (!mine) {
-      var name = document.createElement('div');
-      name.className = 'msg-name';
-      var nameText = document.createElement('span');
-      nameText.textContent = m.name;
+      var name = el('div', 'msg-name');
+      var nameText = el('span', '', m.name);
       nameText.dir = 'auto';
       name.appendChild(nameText);
-      if (m.admin) {
-        var badge = document.createElement('span');
-        badge.className = 'badge';
-        badge.textContent = 'مدیر';
-        name.appendChild(badge);
-      }
-      li.appendChild(name);
+      if (m.admin) name.appendChild(el('span', 'badge', 'مدیر'));
+      bubble.appendChild(name);
     }
 
-    var text = document.createElement('div');
-    text.className = 'msg-text';
+    var text = el('div', 'msg-text');
     text.dir = 'auto';
     fillText(text, m.text);
-    li.appendChild(text);
+    bubble.appendChild(text);
 
-    var meta = document.createElement('div');
-    meta.className = 'msg-meta';
-    li.appendChild(meta);
+    var meta = el('span', 'msg-meta');
+    var time = el('time', '', formatTime(m.ts));
+    time.dateTime = new Date(m.ts).toISOString();
+    time.title = new Date(m.ts).toLocaleString('fa-IR');
+    meta.appendChild(time);
+    if (mine) meta.appendChild(icon(pending ? 'i-clock' : 'i-check'));
+    bubble.appendChild(meta);
 
-    if (opts && opts.pending) {
-      li.classList.add('pending');
-      var st = document.createElement('span');
-      st.className = 'msg-status';
-      st.textContent = 'در حال ارسال…';
-      meta.appendChild(st);
-    } else {
-      if (mine || (state.user && state.user.admin)) {
-        var del = document.createElement('button');
-        del.type = 'button';
-        del.textContent = 'حذف';
-        del.addEventListener('click', function () { deleteMessage(m.id); });
-        meta.appendChild(del);
-      }
-      var time = document.createElement('time');
-      time.textContent = formatTime(m.ts);
-      time.dateTime = new Date(m.ts).toISOString();
-      meta.appendChild(time);
+    col.appendChild(bubble);
+
+    var canDelete = !pending && m.id && (mine || (state.user && state.user.admin));
+    var actions = null;
+    if (canDelete) {
+      actions = el('div', 'msg-actions');
+      var del = el('button');
+      del.type = 'button';
+      del.title = 'حذف پیام';
+      del.setAttribute('aria-label', 'حذف پیام');
+      del.appendChild(icon('i-trash'));
+      del.addEventListener('click', function (e) {
+        e.stopPropagation();
+        deleteMessage(m.id);
+      });
+      actions.appendChild(del);
+      // Phones have no hover: tap the bubble to show the delete button.
+      bubble.addEventListener('click', function (e) {
+        if (e.target.closest('a')) return;
+        var open = li.classList.contains('show-actions');
+        var shown = list.querySelectorAll('.show-actions');
+        for (var i = 0; i < shown.length; i++) shown[i].classList.remove('show-actions');
+        if (!open) li.classList.add('show-actions');
+      });
     }
+
+    // Order inside the row (RTL): others = avatar, bubble, actions;
+    // mine = actions, bubble (so the button sits toward the middle).
+    if (mine && actions) li.appendChild(actions);
+    li.appendChild(col);
+    if (!mine && actions) li.appendChild(actions);
     return li;
+  }
+
+  // Groups consecutive messages, adds day separators and the empty state.
+  function relayout() {
+    var seps = list.querySelectorAll('li.day');
+    for (var s = 0; s < seps.length; s++) list.removeChild(seps[s]);
+
+    var msgs = list.querySelectorAll('li.msg');
+    var prev = null;
+    for (var i = 0; i < msgs.length; i++) {
+      var li = msgs[i];
+      var ts = Number(li.getAttribute('data-ts'));
+      var uid = li.getAttribute('data-uid');
+      var newDay = !prev || dayKey(Number(prev.getAttribute('data-ts'))) !== dayKey(ts);
+      if (newDay) {
+        var sep = el('li', 'day');
+        sep.appendChild(el('span', '', dayLabel(ts)));
+        list.insertBefore(sep, li);
+      }
+      var newGroup = newDay || !prev || prev.getAttribute('data-uid') !== uid ||
+        ts - Number(prev.getAttribute('data-ts')) > 5 * 60 * 1000;
+      li.classList.toggle('first', newGroup);
+      if (prev) prev.classList.toggle('last', newGroup);
+      prev = li;
+    }
+    if (prev) prev.classList.add('last');
+    $('empty').hidden = msgs.length > 0;
   }
 
   // Inserts a confirmed message in id order, above any still-pending ones.
   function insertConfirmed(li, id) {
     var ref = list.lastElementChild;
-    while (ref && (ref.classList.contains('pending') || Number(ref.getAttribute('data-id')) > id)) {
+    while (ref && (ref.classList.contains('pending') || ref.classList.contains('day') ||
+      Number(ref.getAttribute('data-id')) > id)) {
       ref = ref.previousElementSibling;
     }
     list.insertBefore(li, ref ? ref.nextSibling : list.firstChild);
   }
 
   function upsertMessage(m) {
-    if (m.cid && state.pending[m.cid] && state.user && m.uid === state.user.uid) {
-      var p = state.pending[m.cid];
-      clearTimeout(p.timer);
-      if (p.li.parentNode) p.li.parentNode.removeChild(p.li);
-      delete state.pending[m.cid];
-    }
-    if (list.querySelector('li[data-id="' + m.id + '"]')) return;
+    if (m.cid && state.pending[m.cid] && isMine(m)) dropPending(m.cid, true);
+    if (list.querySelector('li[data-id="' + Number(m.id) + '"]')) { relayout(); return; }
     var stick = isNearBottom();
-    insertConfirmed(buildMessage(m), m.id);
-    var mine = state.user && m.uid === state.user.uid;
-    if (stick || mine) scrollToBottom(); else $('jump').hidden = false;
+    insertConfirmed(buildMessage(m, false), m.id);
+    relayout();
+    var mine = isMine(m);
+    if (stick || mine) {
+      scrollToBottom();
+    } else {
+      state.unseen += 1;
+      renderJump();
+    }
     if (!mine && document.hidden) {
       state.unread += 1;
       document.title = '(' + faNum(state.unread) + ') ' + state.baseTitle;
@@ -389,43 +550,55 @@
   }
 
   function renderAll(messages) {
-    // Messages that were delivered while we were disconnected are no longer pending.
+    // Messages delivered while we were disconnected are no longer pending.
     for (var k = 0; k < messages.length; k++) {
       var m = messages[k];
-      if (m.cid && state.pending[m.cid] && state.user && m.uid === state.user.uid) dropPending(m.cid);
+      if (m.cid && state.pending[m.cid] && isMine(m)) dropPending(m.cid, true);
     }
     var pendingEls = list.querySelectorAll('li.pending');
     list.innerHTML = '';
     var frag = document.createDocumentFragment();
-    for (var i = 0; i < messages.length; i++) frag.appendChild(buildMessage(messages[i]));
+    for (var i = 0; i < messages.length; i++) frag.appendChild(buildMessage(messages[i], false));
     for (var j = 0; j < pendingEls.length; j++) frag.appendChild(pendingEls[j]);
     list.appendChild(frag);
+    relayout();
     scrollToBottom();
   }
 
   function removeMessage(id) {
     var li = list.querySelector('li[data-id="' + Number(id) + '"]');
-    if (li) li.parentNode.removeChild(li);
-  }
-
-  function renderPresence(users) {
-    $('online-count').textContent = faNum(users.length);
-    var ul = $('online-list');
-    ul.innerHTML = '';
-    users.sort(function (a, b) { return (b.admin ? 1 : 0) - (a.admin ? 1 : 0); });
-    for (var i = 0; i < users.length; i++) {
-      var li = document.createElement('li');
-      li.dir = 'auto';
-      li.textContent = users[i].name + (users[i].admin ? ' (مدیر)' : '');
-      ul.appendChild(li);
+    if (li) {
+      li.parentNode.removeChild(li);
+      relayout();
+      renderJump();
     }
   }
 
-  $('online-btn').addEventListener('click', function () {
-    var panel = $('online-panel');
-    panel.hidden = !panel.hidden;
-    $('online-btn').setAttribute('aria-expanded', String(!panel.hidden));
-  });
+  function renderPresence(users) {
+    state.online = users;
+    var me = state.user ? state.user.uid : '';
+    users.sort(function (a, b) {
+      if ((a.uid === me) !== (b.uid === me)) return a.uid === me ? -1 : 1;
+      if (a.admin !== b.admin) return a.admin ? -1 : 1;
+      return a.name.localeCompare(b.name, 'fa');
+    });
+    $('online-count').textContent = faNum(users.length);
+    $('side-count').textContent = faNum(users.length);
+    var ul = $('online-list');
+    ul.innerHTML = '';
+    for (var i = 0; i < users.length; i++) {
+      var u = users[i];
+      var li = el('li');
+      li.appendChild(makeAvatar(u));
+      var name = el('span', 'person-name', u.name);
+      name.dir = 'auto';
+      li.appendChild(name);
+      if (u.uid === me) li.appendChild(el('span', 'person-you', 'شما'));
+      if (u.admin) li.appendChild(el('span', 'badge', 'مدیر'));
+      ul.appendChild(li);
+    }
+    renderStatus();
+  }
 
   document.addEventListener('visibilitychange', function () {
     if (!document.hidden) {
@@ -434,13 +607,26 @@
     }
   });
 
+  // Tapping elsewhere hides the delete button again (phones).
+  document.addEventListener('click', function (e) {
+    if (e.target.closest && e.target.closest('.msg')) return;
+    var shown = list.querySelectorAll('.show-actions');
+    for (var i = 0; i < shown.length; i++) shown[i].classList.remove('show-actions');
+  });
+
   // ---------- sending ----------
 
   function autosize() {
     input.style.height = 'auto';
-    input.style.height = Math.min(input.scrollHeight + 2, 160) + 'px';
+    input.style.height = Math.min(input.scrollHeight + 3, 160) + 'px';
   }
-  input.addEventListener('input', autosize);
+  function updateSendButton() {
+    sendBtn.disabled = !input.value.trim();
+  }
+  input.addEventListener('input', function () {
+    autosize();
+    updateSendButton();
+  });
 
   input.addEventListener('keydown', function (e) {
     // On computers Enter sends and Shift+Enter adds a new line.
@@ -451,6 +637,9 @@
     }
   });
 
+  // Keep the keyboard open on phones when tapping the send button.
+  sendBtn.addEventListener('mousedown', function (e) { e.preventDefault(); });
+
   $('composer').addEventListener('submit', function (e) {
     e.preventDefault();
     submit();
@@ -458,50 +647,60 @@
 
   function submit() {
     var text = input.value.trim();
-    if (!text) return;
+    if (!text || !state.user) return;
     if (text.length > state.config.maxMessageLength) { window.alert(ERRORS.too_long); return; }
     input.value = '';
     autosize();
-    if (!isTouch) input.focus();
+    updateSendButton();
 
     var cid = randomId();
-    var li = buildMessage({ uid: state.user.uid, name: state.user.name, admin: state.user.admin, text: text }, { pending: true });
+    var li = buildMessage({ uid: state.user.uid, name: state.user.name, admin: state.user.admin, text: text, ts: Date.now() }, true);
     li.setAttribute('data-cid', cid);
     list.appendChild(li);
+    relayout();
     scrollToBottom();
     state.pending[cid] = { text: text, li: li, tries: 0, timer: null };
     trySend(cid);
   }
 
-  function setPendingStatus(p, text, failed, actions) {
+  function setPendingError(p, text, actions) {
+    var col = p.li.querySelector('.msg-col');
+    var old = col.querySelector('.msg-error');
+    if (old) col.removeChild(old);
     var meta = p.li.querySelector('.msg-meta');
-    meta.innerHTML = '';
-    p.li.classList.toggle('failed', !!failed);
-    var st = document.createElement('span');
-    st.textContent = text;
-    meta.appendChild(st);
-    (actions || []).forEach(function (a) {
-      var b = document.createElement('button');
+    meta.removeChild(meta.lastChild);
+    p.li.classList.toggle('failed', !!text);
+    meta.appendChild(icon(text ? 'i-alert' : 'i-clock'));
+    if (!text) return;
+    var stick = isNearBottom();
+    var box = el('div', 'msg-error');
+    box.appendChild(el('span', '', text));
+    actions.forEach(function (a) {
+      var b = el('button');
       b.type = 'button';
-      b.textContent = a.label;
+      if (a.icon) b.appendChild(icon(a.icon));
+      b.appendChild(document.createTextNode(a.label));
       b.addEventListener('click', a.run);
-      meta.appendChild(b);
+      box.appendChild(b);
     });
+    col.appendChild(box);
+    if (stick) scrollToBottom();
   }
 
-  function dropPending(cid) {
+  function dropPending(cid, delivered) {
     var p = state.pending[cid];
     if (!p) return;
     clearTimeout(p.timer);
     if (p.li.parentNode) p.li.parentNode.removeChild(p.li);
     delete state.pending[cid];
+    if (!delivered) relayout();
   }
 
   function trySend(cid) {
     var p = state.pending[cid];
     if (!p) return;
     clearTimeout(p.timer);
-    setPendingStatus(p, 'در حال ارسال…', false);
+    setPendingError(p, '');
     api('POST', '/api/send', { text: p.text, cid: cid }, 20000).then(function (data) {
       upsertMessage(data.message);
     }, function (err) {
@@ -512,13 +711,13 @@
         // Keep retrying in the background; poor connections recover eventually.
         p.tries += 1;
         var delay = Math.min(30000, 2000 * Math.pow(2, p.tries - 1));
-        setPendingStatus(p, 'ارسال نشد؛ دوباره تلاش می‌شود…', true, [
-          { label: 'الان بفرست', run: function () { trySend(cid); } },
+        setPendingError(p, 'ارسال نشد؛ تلاش خودکار…', [
+          { label: 'الان بفرست', icon: 'i-retry', run: function () { trySend(cid); } },
           { label: 'لغو', run: function () { dropPending(cid); } }
         ]);
         p.timer = setTimeout(function () { trySend(cid); }, delay);
       } else {
-        setPendingStatus(p, errorText(err), true, [
+        setPendingError(p, errorText(err), [
           { label: 'حذف', run: function () { dropPending(cid); } }
         ]);
       }
@@ -535,6 +734,9 @@
       else window.alert(errorText(err));
     });
   }
+
+  // Day labels ("today", "yesterday") change at midnight.
+  setInterval(function () { if (state.user) relayout(); }, 10 * 60 * 1000);
 
   // ---------- start ----------
 
