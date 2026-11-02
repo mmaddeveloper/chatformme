@@ -163,6 +163,7 @@ public/fonts/        (اختیاری) فایل‌های فونت وزیرمتن
 public/app.js        منطق سمت مرورگر
 deploy/              نمونهٔ تنظیمات systemd و nginx
 test/smoke.js        تست خودکار
+.claude/skills/      مهارت‌های طراحی رابط کاربری برای Claude Code (از emilkowalski/skills)
 ```
 
 ## تست

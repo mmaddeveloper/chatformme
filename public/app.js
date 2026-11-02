@@ -28,8 +28,19 @@
     return s;
   }
 
+  function makeFormat(Ctor, opts) {
+    try { return new Ctor('fa-IR', opts); } catch (e) { return null; }
+  }
+  var fmtNum = makeFormat(Intl.NumberFormat);
+  var fmtTime = makeFormat(Intl.DateTimeFormat, { hour: '2-digit', minute: '2-digit' });
+  var fmtShortDate = makeFormat(Intl.DateTimeFormat, { day: 'numeric', month: 'short' });
+  var fmtLongDate = makeFormat(Intl.DateTimeFormat, { weekday: 'long', day: 'numeric', month: 'long' });
+
   function faNum(n) {
-    try { return Number(n).toLocaleString('fa-IR'); } catch (e) { return String(n); }
+    return fmtNum ? fmtNum.format(n) : String(n);
+  }
+  function faCount(n) {
+    return n > 99 ? faNum(99) + '+' : faNum(n);
   }
 
   function el(tag, className, text) {
@@ -56,9 +67,12 @@
     for (var i = 0; i < uid.length; i++) h = (h * 31 + uid.charCodeAt(i)) >>> 0;
     return 'c' + (h % 8);
   }
+  var segmenter = window.Intl && Intl.Segmenter ? new Intl.Segmenter() : null;
   function initial(name) {
-    var chars = Array.from(String(name || '').trim());
-    return chars.length ? chars[0].toUpperCase() : '?';
+    var text = String(name || '').trim();
+    if (!text) return '?';
+    var first = segmenter ? segmenter.segment(text)[Symbol.iterator]().next().value.segment : Array.from(text)[0];
+    return first.toUpperCase();
   }
   function setAvatar(node, uid, name, online) {
     node.className = 'avatar ' + colorClass(uid) + (online ? ' online' : '');
@@ -231,6 +245,8 @@
     list.innerHTML = '';
     state.lastSeq = 0;
     state.convs = {};
+    convNodes = {};
+    $('conv-list').innerHTML = '';
     state.openConv = null;
     state.adminRead = 0;
     state.lastReplyId = 0;
@@ -290,11 +306,13 @@
       if (!c) return;
       online = !!state.onlineVisitors[c.uid];
       $('chat-title').textContent = c.name;
+      $('chat-title').title = c.name;
       setAvatar($('top-avatar'), c.uid, c.name, online);
       $('top-avatar').hidden = false;
       text = online ? 'آنلاین' : 'آفلاین';
     } else {
       $('chat-title').textContent = state.baseTitle;
+      $('chat-title').title = state.baseTitle;
       online = state.adminsOnline > 0;
       text = online ? 'پاسخگو آنلاین است' : 'پاسخگو الان آنلاین نیست؛ پیام شما می‌رسد';
     }
@@ -489,51 +507,99 @@
     if (dayKey(ts) === dayKey(now.getTime())) return formatTime(ts);
     var y = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
     if (dayKey(ts) === dayKey(y.getTime())) return 'دیروز';
-    try { return d.toLocaleDateString('fa-IR', { day: 'numeric', month: 'short' }); } catch (e) { return d.toDateString(); }
+    return fmtShortDate ? fmtShortDate.format(d) : d.toDateString();
+  }
+
+  // uid -> { sig, li }: lets the inbox redraw only the rows that changed.
+  var convNodes = {};
+
+  function buildConvItem(c, online, active, timeText) {
+    var li = el('li');
+    var btn = el('button', 'conv-item' + (active ? ' active' : '') + (c.unread ? ' unread' : ''));
+    btn.type = 'button';
+    btn.appendChild(setAvatar(el('span'), c.uid, c.name, online));
+    var body = el('div', 'conv-body');
+    var top = el('div', 'conv-top');
+    var name = el('span', 'conv-name', c.name);
+    name.dir = 'auto';
+    name.title = c.name;
+    top.appendChild(name);
+    top.appendChild(el('time', 'conv-time', timeText));
+    body.appendChild(top);
+    var bottom = el('div', 'conv-bottom');
+    var preview = el('span', 'conv-preview');
+    if (c.last) {
+      var text = c.last.text.replace(/\s+/g, ' ');
+      if (c.last.from === 'admin') {
+        preview.appendChild(el('b', '', 'شما: '));
+        preview.appendChild(el('bdi', '', text));
+      } else {
+        preview.dir = 'auto'; // an English preview shows its start, a Persian one stays right-aligned
+        preview.textContent = text;
+      }
+    } else {
+      preview.textContent = 'پیامی نیست';
+    }
+    bottom.appendChild(preview);
+    if (c.unread) bottom.appendChild(el('span', 'conv-unread', faCount(c.unread)));
+    body.appendChild(bottom);
+    btn.appendChild(body);
+    btn.addEventListener('click', function () { openConversation(c.uid); });
+    li.appendChild(btn);
+    return li;
   }
 
   function renderConvList() {
     if (!isAdmin()) return;
     var ul = $('conv-list');
-    var ids = Object.keys(state.convs);
-    var convs = ids.map(function (k) { return state.convs[k]; });
+    var convs = Object.keys(state.convs).map(function (k) { return state.convs[k]; });
     convs.sort(function (a, b) { return b.lastTs - a.lastTs; });
-    var frag = document.createDocumentFragment();
+
     var total = 0;
+    var order = [];
+    var changed = [];
+    var fresh = {};
     convs.forEach(function (c) {
       total += c.unread;
-      var li = el('li');
-      var btn = el('button', 'conv-item' + (c.uid === state.openConv ? ' active' : '') + (c.unread ? ' unread' : ''));
-      btn.type = 'button';
-      btn.appendChild(setAvatar(el('span'), c.uid, c.name, !!state.onlineVisitors[c.uid]));
-      var body = el('div', 'conv-body');
-      var top = el('div', 'conv-top');
-      var name = el('span', 'conv-name', c.name);
-      name.dir = 'auto';
-      top.appendChild(name);
-      top.appendChild(el('span', 'conv-time', convTime(c.lastTs)));
-      body.appendChild(top);
-      var bottom = el('div', 'conv-bottom');
-      var preview = el('span', 'conv-preview');
-      if (c.last) {
-        if (c.last.from === 'admin') preview.appendChild(el('b', '', 'شما: '));
-        preview.appendChild(el('bdi', '', c.last.text.replace(/\s+/g, ' ')));
+      order.push(c.uid);
+      var online = !!state.onlineVisitors[c.uid];
+      var active = c.uid === state.openConv;
+      var timeText = convTime(c.lastTs);
+      var sig = [c.name, timeText, c.unread, online, active, c.last ? c.last.from + ':' + c.last.text : ''].join('\u0001');
+      var old = convNodes[c.uid];
+      if (old && old.sig === sig) {
+        fresh[c.uid] = old;
       } else {
-        preview.textContent = 'پیامی نیست';
+        fresh[c.uid] = { sig: sig, li: buildConvItem(c, online, active, timeText) };
+        changed.push({ old: old, entry: fresh[c.uid] });
       }
-      bottom.appendChild(preview);
-      if (c.unread) bottom.appendChild(el('span', 'conv-unread', faNum(c.unread)));
-      body.appendChild(bottom);
-      btn.appendChild(body);
-      btn.addEventListener('click', function () { openConversation(c.uid); });
-      li.appendChild(btn);
-      frag.appendChild(li);
     });
-    ul.innerHTML = '';
-    ul.appendChild(frag);
+
+    // Drop rows that were rebuilt or no longer exist, then move only the rows
+    // that are out of place (a new message usually lifts a single row to the top).
+    changed.forEach(function (ch) {
+      if (ch.old && ch.old.li.parentNode === ul) ul.removeChild(ch.old.li);
+    });
+    Object.keys(convNodes).forEach(function (uid) {
+      var li = convNodes[uid].li;
+      if (!fresh[uid] && li.parentNode === ul) ul.removeChild(li);
+    });
+    var cursor = ul.firstChild;
+    order.forEach(function (uid) {
+      var li = fresh[uid].li;
+      if (li === cursor) cursor = cursor.nextSibling;
+      else ul.insertBefore(li, cursor);
+    });
+    while (cursor) {
+      var next = cursor.nextSibling;
+      ul.removeChild(cursor);
+      cursor = next;
+    }
+    convNodes = fresh;
+
     $('inbox-empty').hidden = convs.length > 0;
     $('unread-total').hidden = !total;
-    $('unread-total').textContent = faNum(total);
+    $('unread-total').textContent = faCount(total);
     updateTitle();
   }
 
@@ -669,7 +735,7 @@
     var show = !isNearBottom() && list.scrollHeight > list.clientHeight;
     $('jump').hidden = !show;
     $('jump-count').hidden = !state.unseen;
-    $('jump-count').textContent = faNum(state.unseen);
+    $('jump-count').textContent = faCount(state.unseen);
   }
   $('jump').addEventListener('click', scrollToBottom);
   list.addEventListener('scroll', function () {
@@ -678,8 +744,7 @@
   });
 
   function formatTime(ts) {
-    var d = new Date(ts);
-    try { return d.toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' }); } catch (e) { return d.toLocaleTimeString(); }
+    return fmtTime ? fmtTime.format(ts) : new Date(ts).toLocaleTimeString();
   }
 
   function dayKey(ts) {
@@ -692,11 +757,7 @@
     var yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
     if (dayKey(ts) === dayKey(today.getTime())) return 'امروز';
     if (dayKey(ts) === dayKey(yesterday.getTime())) return 'دیروز';
-    try {
-      return d.toLocaleDateString('fa-IR', { weekday: 'long', day: 'numeric', month: 'long' });
-    } catch (e) {
-      return d.toDateString();
-    }
+    return fmtLongDate ? fmtLongDate.format(d) : d.toDateString();
   }
 
   var URL_RE = /(https?:\/\/[^\s<>"']+)/g;
@@ -739,6 +800,7 @@
       var name = el('div', 'msg-name');
       var nameText = el('span', '', m.name);
       nameText.dir = 'auto';
+      nameText.title = m.name;
       name.appendChild(nameText);
       if (m.from === 'admin' && !isAdmin()) name.appendChild(el('span', 'badge', 'مدیر'));
       bubble.appendChild(name);
@@ -844,7 +906,9 @@
     if (!isOurs(m) && m.id > state.lastReplyId) state.lastReplyId = m.id;
     if (list.querySelector('li[data-id="' + Number(m.id) + '"]')) { relayout(); return; }
     var stick = isNearBottom();
-    insertConfirmed(buildMessage(m, false), m.id);
+    var li = buildMessage(m, false);
+    if (m.uid !== state.user.uid) li.classList.add('enter');
+    insertConfirmed(li, m.id);
     relayout();
     var ours = isOurs(m);
     if (stick || (ours && m.uid === state.user.uid)) {

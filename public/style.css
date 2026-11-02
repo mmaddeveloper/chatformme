@@ -5,6 +5,7 @@
  */
 
 :root {
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
   --font: Vazirmatn, Vazir, "Segoe UI", Tahoma, -apple-system, BlinkMacSystemFont, system-ui, "Noto Sans Arabic", sans-serif;
 
   --bg: #f3f6f5;
@@ -97,6 +98,12 @@
 
 html, body { height: 100%; }
 
+html {
+  -webkit-tap-highlight-color: transparent; /* we draw our own :active feedback */
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior: none; /* app shell: no pull-to-refresh or page rubber band */
+}
+
 body {
   margin: 0;
   background: var(--bg);
@@ -104,13 +111,20 @@ body {
   font-family: var(--font);
   font-size: 16px;
   line-height: 1.7;
-  -webkit-text-size-adjust: 100%;
   -webkit-font-smoothing: antialiased;
-  -webkit-tap-highlight-color: transparent;
 }
 
 button, input, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; background: none; border: 0; padding: 0; }
+button, a { touch-action: manipulation; } /* no double-tap-zoom wait */
+button {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* Numbers that change in place should not shift their neighbours. */
+time, .count-pill, .conv-unread, .jump-count { font-variant-numeric: tabular-nums; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 svg { width: 20px; height: 20px; flex: none; display: block; }
@@ -166,8 +180,8 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   color: var(--muted);
   flex: none;
 }
-.icon-btn:hover { background: var(--hover); color: var(--text); }
-.icon-btn.danger:hover { background: var(--danger-soft); color: var(--danger); }
+.icon-btn { transition: transform 160ms var(--ease-out), background-color 150ms ease, color 150ms ease; }
+.icon-btn:active { transform: scale(0.95); background: var(--hover); }
 
 .btn-primary {
   height: 48px;
@@ -176,9 +190,9 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   color: var(--on-accent);
   font-weight: 700;
   font-size: 1rem;
-  transition: background-color 0.15s;
+  transition: transform 160ms var(--ease-out), background-color 150ms ease, opacity 150ms ease;
 }
-.btn-primary:hover { background: var(--accent-hover); }
+.btn-primary:active:not(:disabled) { transform: scale(0.97); }
 .btn-primary:disabled { opacity: 0.6; cursor: default; }
 
 .btn-link {
@@ -188,7 +202,8 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   border-radius: 8px;
   align-self: center;
 }
-.btn-link:hover { color: var(--accent); background: var(--hover); }
+.btn-link { transition: transform 160ms var(--ease-out), background-color 150ms ease, color 150ms ease; }
+.btn-link:active { transform: scale(0.97); }
 
 .btn-ghost {
   display: inline-flex;
@@ -201,7 +216,8 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   font-size: 0.88rem;
 }
 .btn-ghost svg { width: 18px; height: 18px; }
-.btn-ghost:hover { background: var(--danger-soft); color: var(--danger); }
+.btn-ghost { transition: transform 160ms var(--ease-out), background-color 150ms ease, color 150ms ease; }
+.btn-ghost:active { transform: scale(0.97); background: var(--danger-soft); color: var(--danger); }
 
 .empty-icon {
   width: 72px;
@@ -220,6 +236,7 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
 
 .join {
   min-height: 100%;
+  min-height: 100svh;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -258,8 +275,8 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
 }
 .join-logo svg { width: 34px; height: 34px; }
 
-.join-title { margin: 0; font-size: 1.45rem; line-height: 1.4; text-align: center; overflow-wrap: anywhere; }
-.join-sub { margin: -8px 0 6px; color: var(--muted); font-size: 0.95rem; text-align: center; }
+.join-title { margin: 0; font-size: 1.45rem; line-height: 1.4; text-align: center; overflow-wrap: anywhere; text-wrap: balance; }
+.join-sub { margin: -8px 0 6px; color: var(--muted); font-size: 0.95rem; text-align: center; text-wrap: balance; }
 
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field label { font-size: 0.88rem; font-weight: 600; color: var(--text-2); }
@@ -271,7 +288,7 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   border-radius: 14px;
   background: var(--surface-2);
   font-size: 16px; /* prevents iOS zoom on focus */
-  transition: border-color 0.15s, background-color 0.15s;
+  transition: border-color 150ms ease, background-color 150ms ease;
 }
 .field input::placeholder { color: var(--muted); opacity: 0.7; }
 .field input:focus { outline: none; border-color: var(--accent); background: var(--surface); }
@@ -289,15 +306,13 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
 .join-foot {
   margin: 0;
   max-width: 400px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
   color: var(--muted);
   font-size: 0.82rem;
   text-align: center;
+  text-wrap: balance;
 }
-.join-foot svg { width: 15px; height: 15px; }
+/* Inline, so the icon stays with the first word when the line wraps. */
+.join-foot svg { display: inline-block; width: 15px; height: 15px; vertical-align: -2px; margin-inline-end: 6px; }
 
 /* ---------- app layout ---------- */
 
@@ -306,6 +321,8 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   height: 100vh;
   height: var(--app-h, 100dvh);
   overflow: hidden;
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
 }
 
 .main {
@@ -384,6 +401,7 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   padding: 6px;
   flex: 1;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .conv-item {
   width: 100%;
@@ -394,7 +412,8 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   border-radius: 14px;
   text-align: start;
 }
-.conv-item:hover { background: var(--hover); }
+.conv-item { transition: background-color 120ms ease; }
+.conv-item:active { background: var(--hover); }
 .conv-item.active { background: var(--active); }
 .conv-item .avatar { width: 46px; height: 46px; font-size: 1.1rem; }
 .conv-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
@@ -546,6 +565,10 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   background: var(--warn);
 }
 .conn[data-state="offline"]::before { background: var(--danger); }
+.conn { transition: opacity 200ms var(--ease-out), transform 200ms var(--ease-out); }
+@starting-style {
+  .conn { opacity: 0; transform: translate(-50%, -8px); }
+}
 
 /* ---------- messages ---------- */
 
@@ -668,6 +691,13 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
 
 .msg.pending .bubble { opacity: 0.8; }
 
+/* Only messages that arrive from the other side ease in; my own sends
+   (often via Enter) and history appear instantly. */
+.msg.enter { transition: opacity 200ms var(--ease-out), transform 200ms var(--ease-out); }
+@starting-style {
+  .msg.enter { opacity: 0; transform: translateY(6px); }
+}
+
 .msg-error {
   display: flex;
   flex-wrap: wrap;
@@ -690,15 +720,15 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   font-size: 0.78rem;
 }
 .msg-error button svg { width: 13px; height: 13px; }
-.msg-error button:hover { border-color: var(--accent); color: var(--accent); }
+.msg-error button { transition: transform 160ms var(--ease-out), border-color 150ms ease, color 150ms ease; }
+.msg-error button:active { transform: scale(0.97); }
 
 .msg-actions {
   align-self: center;
   opacity: 0;
   visibility: hidden;
-  transition: opacity 0.12s;
+  transition: opacity 150ms ease, visibility 150ms;
 }
-.msg:hover .msg-actions,
 .msg:focus-within .msg-actions,
 .msg.show-actions .msg-actions { opacity: 1; visibility: visible; }
 .msg-actions button {
@@ -713,7 +743,8 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   box-shadow: var(--bubble-shadow);
 }
 .msg-actions button svg { width: 17px; height: 17px; }
-.msg-actions button:hover { color: var(--danger); background: var(--danger-soft); }
+.msg-actions button { transition: transform 160ms var(--ease-out), background-color 150ms ease, color 150ms ease; }
+.msg-actions button:active { transform: scale(0.95); color: var(--danger); background: var(--danger-soft); }
 
 .empty {
   position: absolute;
@@ -728,7 +759,7 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   text-align: center;
   pointer-events: none;
 }
-.empty p { margin: 0; font-size: 0.95rem; max-width: 320px; }
+.empty p { margin: 0; font-size: 0.95rem; max-width: 320px; text-wrap: balance; }
 
 .jump {
   position: absolute;
@@ -745,6 +776,11 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   justify-content: center;
 }
 .jump svg { width: 22px; height: 22px; }
+.jump { transition: opacity 150ms var(--ease-out), transform 160ms var(--ease-out); }
+.jump:active { transform: scale(0.95); }
+@starting-style {
+  .jump { opacity: 0; transform: translateY(6px) scale(0.95); }
+}
 .jump-count {
   position: absolute;
   top: -6px;
@@ -788,7 +824,7 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   background: var(--surface-2);
   font-size: 16px;
   line-height: 1.6;
-  transition: border-color 0.15s, background-color 0.15s;
+  transition: border-color 150ms ease, background-color 150ms ease;
 }
 .composer textarea::placeholder { color: var(--muted); opacity: 0.8; }
 .composer textarea:focus { outline: none; border-color: var(--accent); background: var(--surface); }
@@ -803,11 +839,10 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   justify-content: center;
   background: var(--accent);
   color: var(--on-accent);
-  transition: background-color 0.15s, transform 0.1s, opacity 0.15s;
+  transition: transform 160ms var(--ease-out), background-color 150ms ease, color 150ms ease;
 }
 .send-btn svg { width: 21px; height: 21px; transform: scaleX(-1); /* point left in RTL */ }
-.send-btn:hover:not(:disabled) { background: var(--accent-hover); }
-.send-btn:active:not(:disabled) { transform: scale(0.94); }
+.send-btn:active:not(:disabled) { transform: scale(0.95); }
 .send-btn:disabled { background: var(--surface-2); color: var(--muted); cursor: default; }
 
 .noscript { text-align: center; padding: 24px 16px; }
@@ -842,11 +877,24 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   .msg > .avatar { display: none; }
 }
 
-@media (hover: none) {
-  .msg:hover .msg-actions { opacity: 0; visibility: hidden; }
-  .msg.show-actions .msg-actions { opacity: 1; visibility: visible; }
+/* Hover styles only for devices that really hover; on touch screens a tap
+   would leave them stuck on. */
+@media (hover: hover) and (pointer: fine) {
+  .icon-btn:hover { background: var(--hover); color: var(--text); }
+  .icon-btn.danger:hover { background: var(--danger-soft); color: var(--danger); }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn-link:hover { color: var(--accent); background: var(--hover); }
+  .btn-ghost:hover { background: var(--danger-soft); color: var(--danger); }
+  .conv-item:hover { background: var(--hover); }
+  .conv-item.active:hover { background: var(--active); }
+  .msg:hover .msg-actions { opacity: 1; visibility: visible; }
+  .msg-actions button:hover { color: var(--danger); background: var(--danger-soft); }
+  .msg-error button:hover { border-color: var(--accent); color: var(--accent); }
+  .send-btn:hover:not(:disabled) { background: var(--accent-hover); }
+  .jump:hover { color: var(--accent); }
 }
 
+/* Reduced motion: keep the fades that help, drop the movement. */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { transition: none !important; }
+  .msg.enter, .conn, .jump { transition-property: opacity; }
 }
