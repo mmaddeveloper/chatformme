@@ -17,7 +17,7 @@
   --active: #e3f2ee;
   --text: #0f1a17;
   --text-2: #3b4a46;
-  --muted: #6b7a76;
+  --muted: #5d6c68;
   --border: #e2e8e6;
   --accent: #0f766e;
   --accent-hover: #0c5f58;
@@ -31,6 +31,7 @@
   --danger: #c0262d;
   --danger-soft: #fde8e8;
   --ok: #16a34a;
+  --ok-text: #15803d;
   --warn: #d97706;
   --bubble-shadow: 0 1px 1.5px rgba(16, 24, 22, 0.08);
   --card-shadow: 0 10px 30px rgba(16, 40, 34, 0.08), 0 1px 3px rgba(16, 40, 34, 0.06);
@@ -69,6 +70,7 @@
     --read: #5eead4;
     --other-bg: #1a2522;
     --danger: #f87171;
+    --ok-text: #4ade80;
     --danger-soft: #3a1717;
     --bubble-shadow: none;
     --card-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
@@ -155,7 +157,7 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   height: 11px;
   border-radius: 50%;
   background: var(--ok);
-  border: 2px solid var(--surface);
+  border: 2px solid var(--ring, var(--surface));
 }
 
 .badge {
@@ -414,7 +416,7 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
 }
 .conv-item { transition: background-color 120ms ease; }
 .conv-item:active { background: var(--hover); }
-.conv-item.active { background: var(--active); }
+.conv-item.active { background: var(--active); --ring: var(--active); }
 .conv-item .avatar { width: 46px; height: 46px; font-size: 1.1rem; }
 .conv-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .conv-top, .conv-bottom { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -536,7 +538,7 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
 .status span { overflow: hidden; text-overflow: ellipsis; }
 .status i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); opacity: 0.6; flex: none; }
 .status[data-state="online"] i { background: var(--ok); opacity: 1; }
-.status[data-state="online"] { color: var(--ok); }
+.status[data-state="online"] { color: var(--ok-text); }
 
 /* ---------- connection toast ---------- */
 
@@ -885,8 +887,8 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
   .btn-link:hover { color: var(--accent); background: var(--hover); }
   .btn-ghost:hover { background: var(--danger-soft); color: var(--danger); }
-  .conv-item:hover { background: var(--hover); }
-  .conv-item.active:hover { background: var(--active); }
+  .conv-item:hover { background: var(--hover); --ring: var(--hover); }
+  .conv-item.active:hover { background: var(--active); --ring: var(--active); }
   .msg:hover .msg-actions { opacity: 1; visibility: visible; }
   .msg-actions button:hover { color: var(--danger); background: var(--danger-soft); }
   .msg-error button:hover { border-color: var(--accent); color: var(--accent); }

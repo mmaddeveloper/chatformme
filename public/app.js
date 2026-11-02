@@ -186,6 +186,10 @@
     document.title = state.baseTitle;
     var lastName = storage.get('chat.name');
     if (lastName && !$('name').value) $('name').value = lastName;
+    // Undo "admin login" mode from a previous session on this device.
+    $('password-label').textContent = 'رمز ورود';
+    $('join-btn').textContent = 'شروع گفتگو';
+    $('password').value = '';
     $('password-row').hidden = !state.config.passwordRequired;
     $('admin-toggle').hidden = state.config.passwordRequired || !state.config.adminEnabled;
     showJoinError(message || '');
@@ -382,6 +386,11 @@
       on('delete', adminDelete);
       on('read', adminReadEvent);
       on('convdelete', adminConvDelete);
+      on('rename', function (d) {
+        state.convs[d.conv] = d.summary;
+        renderConvList();
+        renderTopbar();
+      });
       on('presence', adminPresence);
     } else {
       on('reset', visitorReset);
@@ -442,7 +451,8 @@
 
   function visitorReset(d) {
     state.adminRead = d.adminRead || 0;
-    renderAll(d.messages);
+    // A reset after a long disconnect should not yank someone who is reading older messages.
+    renderAll(d.messages, list.childElementCount > 0 && !isNearBottom());
     markReadSoon();
   }
 

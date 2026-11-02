@@ -66,7 +66,8 @@ fs.mkdirSync(config.dataDir, { recursive: true });
 
 // state.convs: visitor uid -> { uid, name, created, messages: [], adminRead, visitorRead }
 // adminRead / visitorRead: id of the last message each side has seen.
-let state = { seq: 0, convs: {} };
+// A prototype-less object so ids like "__proto__" can never match a built-in.
+let state = { seq: 0, convs: Object.create(null) };
 try {
   const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
   if (!raw || typeof raw.convs !== 'object' || !raw.convs) throw new Error('unexpected format');
@@ -221,6 +222,13 @@ function rememberCid(key, msg) {
   recentCids.set(key, msg);
   if (recentCids.size > 5000) recentCids.delete(recentCids.keys().next().value);
 }
+function forgetCid(msg) {
+  if (msg.cid) recentCids.delete(msg.uid + ':' + msg.cid);
+}
+
+function getConv(uid) {
+  return typeof uid === 'string' && Object.prototype.hasOwnProperty.call(state.convs, uid) ? state.convs[uid] : null;
+}
 
 // ---------------------------------------------------------------------------
 // Conversations
@@ -268,6 +276,7 @@ function createConv(user) {
 }
 
 function removeConv(uid) {
+  for (const m of state.convs[uid].messages) forgetCid(m);
   delete state.convs[uid];
   state.seq += 1;
   emit({ seq: state.seq, type: 'convdelete', conv: uid, data: { conv: uid } });
@@ -334,7 +343,7 @@ function resetPayload(client) {
     list.sort((a, b) => b.lastTs - a.lastTs);
     return { conversations: list };
   }
-  const conv = state.convs[client.user.uid];
+  const conv = getConv(client.user.uid);
   return { messages: conv ? conv.messages : [], adminRead: conv ? conv.adminRead : 0 };
 }
 
@@ -567,8 +576,13 @@ async function handleJoin(req, res) {
   // Keep the same identity (and so the same conversation) when re-joining.
   const prev = verifyToken(body.prevToken);
   const user = { uid: prev ? prev.uid : randomId(12), name: name, admin: admin };
-  const conv = !admin && state.convs[user.uid];
-  if (conv && conv.name !== name) { conv.name = name; scheduleSave(); }
+  const conv = admin ? null : getConv(user.uid);
+  if (conv && conv.name !== name) {
+    conv.name = name;
+    state.seq += 1;
+    emit({ seq: state.seq, type: 'rename', conv: conv.uid, data: { conv: conv.uid, summary: summary(conv) } });
+    scheduleSave();
+  }
   sendJson(res, 200, { token: makeToken(user), user: user });
 }
 
@@ -587,13 +601,13 @@ async function handleSend(req, res) {
   // Admins reply to an existing conversation; visitors always write to their own.
   let conv = null;
   if (user.admin) {
-    conv = state.convs[String(body.conv)];
+    conv = getConv(String(body.conv));
     if (!conv) return sendJson(res, 404, { error: 'not_found' });
   }
   if ((!user.admin && !sendLimiterUser(user.uid)) || !sendLimiterIp(clientIp(req))) {
     return sendJson(res, 429, { error: 'rate_limited' });
   }
-  if (!conv) conv = state.convs[user.uid] || createConv(user);
+  if (!conv) conv = getConv(user.uid) || createConv(user);
 
   const msg = addMessage(conv, user, text, cid);
   if (cid) rememberCid(cidKey, msg);
@@ -604,13 +618,14 @@ async function handleDelete(req, res) {
   const user = verifyToken(bearer(req));
   if (!user) return sendJson(res, 401, { error: 'unauthorized' });
   const body = await readJson(req);
-  const conv = state.convs[user.admin ? String(body.conv) : user.uid];
+  const conv = getConv(user.admin ? String(body.conv) : user.uid);
   const id = Number(body.id);
   const idx = conv ? conv.messages.findIndex((m) => m.id === id) : -1;
   if (idx === -1) return sendJson(res, 404, { error: 'not_found' });
   // Visitors may delete their own messages; admins may delete any message.
   if (!user.admin && conv.messages[idx].from !== 'visitor') return sendJson(res, 403, { error: 'forbidden' });
 
+  forgetCid(conv.messages[idx]);
   conv.messages.splice(idx, 1);
   state.seq += 1;
   emit({ seq: state.seq, type: 'delete', conv: conv.uid, data: { id: id, conv: conv.uid, summary: summary(conv) } });
@@ -622,7 +637,7 @@ async function handleRead(req, res) {
   const user = verifyToken(bearer(req));
   if (!user) return sendJson(res, 401, { error: 'unauthorized' });
   const body = await readJson(req);
-  const conv = state.convs[user.admin ? String(body.conv) : user.uid];
+  const conv = getConv(user.admin ? String(body.conv) : user.uid);
   if (!conv) return sendJson(res, 200, { ok: true });
   const last = conv.messages.length ? conv.messages[conv.messages.length - 1].id : 0;
   const field = user.admin ? 'adminRead' : 'visitorRead';
@@ -644,7 +659,7 @@ async function handleDeleteConversation(req, res) {
   if (!user.admin) return sendJson(res, 403, { error: 'forbidden' });
   const body = await readJson(req);
   const uid = String(body.conv);
-  if (!state.convs[uid]) return sendJson(res, 404, { error: 'not_found' });
+  if (!getConv(uid)) return sendJson(res, 404, { error: 'not_found' });
   removeConv(uid);
   sendJson(res, 200, { ok: true });
 }
@@ -653,7 +668,7 @@ function handleGetConversation(req, res, url) {
   const user = verifyToken(bearer(req));
   if (!user) return sendJson(res, 401, { error: 'unauthorized' });
   if (!user.admin) return sendJson(res, 403, { error: 'forbidden' });
-  const conv = state.convs[String(url.searchParams.get('conv'))];
+  const conv = getConv(String(url.searchParams.get('conv')));
   if (!conv) return sendJson(res, 404, { error: 'not_found' });
   return sendJson(res, 200, { summary: summary(conv), messages: conv.messages });
 }

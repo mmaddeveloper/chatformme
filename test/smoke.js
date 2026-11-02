@@ -192,6 +192,12 @@ async function main() {
   assert.deepStrictEqual(convAli.data.messages.map((m) => m.id), [sent.data.message.id]);
 
   assert.strictEqual((await call('POST', '/api/send', { text: 'hi', conv: 'nobody' }, admin.token)).status, 404);
+  // Ids that exist on Object.prototype are not conversations.
+  for (const key of ['__proto__', 'constructor', 'toString']) {
+    assert.strictEqual((await call('POST', '/api/send', { text: 'hi', conv: key }, admin.token)).status, 404);
+    assert.strictEqual((await call('GET', '/api/conversation?conv=' + key, undefined, admin.token)).status, 404);
+    assert.strictEqual((await call('POST', '/api/conversation/delete', { conv: key }, admin.token)).status, 404);
+  }
   const reply = await call('POST', '/api/send', { text: 'سلام علی، الان کمکت می‌کنیم', conv: ali.user.uid }, admin.token);
   assert.strictEqual(reply.data.message.from, 'admin');
   const aliReply = await sAli.next('msg');
@@ -223,6 +229,20 @@ async function main() {
   const adminDel = await sAdmin.next('delete');
   assert.strictEqual(adminDel.data.conv, ali.user.uid);
   assert.strictEqual((await call('POST', '/api/delete', { id: reply.data.message.id, conv: ali.user.uid }, admin.token)).status, 200);
+
+  // A retried send must not bring back a message that was deleted meanwhile.
+  const ghost = await call('POST', '/api/send', { text: 'ghost', cid: 'c-ghost' }, ali.token);
+  await call('POST', '/api/delete', { id: ghost.data.message.id }, ali.token);
+  const ghostRetry = await call('POST', '/api/send', { text: 'ghost', cid: 'c-ghost' }, ali.token);
+  assert.notStrictEqual(ghostRetry.data.message.id, ghost.data.message.id);
+  await call('POST', '/api/delete', { id: ghostRetry.data.message.id }, ali.token);
+
+  // Re-joining under a new name updates the admins' inbox right away.
+  await call('POST', '/api/join', { name: 'علی رضایی', password: 'family-pass', prevToken: ali.token });
+  for (;;) {
+    const ev = await sAdmin.next('rename');
+    if (ev.data.conv === ali.user.uid) { assert.strictEqual(ev.data.summary.name, 'علی رضایی'); break; }
+  }
 
   // ---- reconnecting only replays what was missed (and only this visitor's) ----
   const lastId = Number(sAli.events.filter((e) => e.id).pop().id);
