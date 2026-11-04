@@ -18,6 +18,10 @@ const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const os = require('os');
+const { Store } = require('./lib/store');
+
+// Everything this server writes (messages, keys) is private to its own user.
+process.umask(0o077);
 
 // ---------------------------------------------------------------------------
 // Config (all via environment variables)
@@ -37,6 +41,8 @@ const config = {
   dataDir: path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data')),
   maxHistory: intEnv('MAX_HISTORY', 300),          // messages kept per conversation
   maxConversations: intEnv('MAX_CONVERSATIONS', 1000),
+  maxStorageBytes: intEnv('MAX_STORAGE_MB', 32) * 1024 * 1024, // all conversations together
+  maxConvBytes: 256 * 1024,                        // one conversation
   maxMessageLength: 2000,
   maxNameLength: 32,
   maxClients: intEnv('MAX_CLIENTS', 1000),
@@ -46,51 +52,38 @@ const config = {
   tlsKey: process.env.TLS_KEY || '',
 };
 
-const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const VISITOR_TOKEN_TTL_MS = 30 * DAY_MS;
+const ADMIN_TOKEN_TTL_MS = 7 * DAY_MS;   // a leaked admin session expires sooner
+const ADMIN_KEY_MIN_LENGTH = 12;
 const PING_INTERVAL_MS = 25 * 1000;
 const EVENT_LOG_MAX = 2000;
+const SESSION_COOKIE = 'cfm_session';
 
 if (config.password && config.adminKey && config.password === config.adminKey) {
   console.error('CHAT_PASSWORD and ADMIN_KEY must be different.');
   process.exit(1);
 }
+if (config.adminKey && Array.from(config.adminKey).length < ADMIN_KEY_MIN_LENGTH) {
+  console.error('ADMIN_KEY is too short (at least ' + ADMIN_KEY_MIN_LENGTH + ' characters); a short key can be guessed.');
+  process.exit(1);
+}
 
 // ---------------------------------------------------------------------------
-// Storage: conversations are kept in memory and saved to a JSON file.
+// Storage (see lib/store.js): conversations in memory, every change journaled.
 // ---------------------------------------------------------------------------
 
-const DATA_FILE = path.join(config.dataDir, 'conversations.json');
 const SECRET_FILE = path.join(config.dataDir, 'secret.key');
 
-fs.mkdirSync(config.dataDir, { recursive: true });
-
-// state.convs: visitor uid -> { uid, name, created, messages: [], adminRead, visitorRead }
-// adminRead / visitorRead: id of the last message each side has seen.
-// A prototype-less object so ids like "__proto__" can never match a built-in.
-let state = { seq: 0, convs: Object.create(null) };
+let store;
 try {
-  const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  if (!raw || typeof raw.convs !== 'object' || !raw.convs) throw new Error('unexpected format');
-  state.seq = Number(raw.seq) || 0;
-  for (const uid of Object.keys(raw.convs)) {
-    const c = raw.convs[uid];
-    if (!c || !Array.isArray(c.messages)) continue;
-    state.convs[uid] = {
-      uid: uid,
-      name: String(c.name || ''),
-      created: Number(c.created) || Date.now(),
-      messages: c.messages.slice(-config.maxHistory),
-      adminRead: Number(c.adminRead) || 0,
-      visitorRead: Number(c.visitorRead) || 0,
-    };
-  }
+  store = new Store(config.dataDir, {
+    maxHistory: config.maxHistory,
+    maxConvBytes: config.maxConvBytes,
+  }).open();
 } catch (err) {
-  if (err.code !== 'ENOENT') {
-    // Never silently overwrite a file we could not read.
-    const backup = DATA_FILE + '.corrupt-' + Date.now();
-    try { fs.renameSync(DATA_FILE, backup); } catch (e) { /* ignore */ }
-    console.error('Could not read ' + DATA_FILE + ' (' + err.message + '); moved it to ' + backup);
-  }
+  console.error('Could not open the data directory: ' + err.message);
+  process.exit(1);
 }
 
 let secret = '';
@@ -98,21 +91,6 @@ try { secret = fs.readFileSync(SECRET_FILE, 'utf8').trim(); } catch (e) { /* fir
 if (!secret) {
   secret = crypto.randomBytes(32).toString('hex');
   fs.writeFileSync(SECRET_FILE, secret + '\n', { mode: 0o600 });
-}
-
-let saveTimer = null;
-function scheduleSave() {
-  if (!saveTimer) saveTimer = setTimeout(saveNow, 1000);
-}
-function saveNow() {
-  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-  const tmp = DATA_FILE + '.tmp';
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(state));
-    fs.renameSync(tmp, DATA_FILE);
-  } catch (err) {
-    console.error('Saving messages failed:', err.message);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -156,8 +134,10 @@ function verifyToken(token) {
   if (!safeEqual(token.slice(dot + 1), sign(payload))) return null;
   try {
     const d = JSON.parse(fromB64url(payload).toString('utf8'));
-    if (!d || typeof d.t !== 'number' || Date.now() - d.t > TOKEN_TTL_MS) return null;
-    return { uid: String(d.u), name: String(d.n), admin: d.a === 1 };
+    if (!d || typeof d.t !== 'number') return null;
+    const ttl = d.a === 1 ? ADMIN_TOKEN_TTL_MS : VISITOR_TOKEN_TTL_MS;
+    if (Date.now() - d.t > ttl || d.t > Date.now() + 60 * 1000) return null;
+    return { uid: String(d.u), name: String(d.n), admin: d.a === 1, issued: d.t };
   } catch (e) {
     return null;
   }
@@ -165,6 +145,28 @@ function verifyToken(token) {
 function bearer(req) {
   const h = req.headers.authorization || '';
   return h.startsWith('Bearer ') ? h.slice(7) : '';
+}
+
+function cookie(req, name) {
+  const header = req.headers.cookie || '';
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq !== -1 && part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+  }
+  return '';
+}
+
+function isHttps(req) {
+  return useTls || (config.trustProxy && /^https$/i.test(String(req.headers['x-forwarded-proto'] || '')));
+}
+
+// The live stream authenticates with an HttpOnly cookie rather than a token in
+// the URL, so the token never ends up in proxy or server access logs. The
+// cookie is only sent to the stream endpoint and never cross-site.
+function sessionCookie(req, token, user) {
+  const maxAge = token ? Math.floor((user.admin ? ADMIN_TOKEN_TTL_MS : VISITOR_TOKEN_TTL_MS) / 1000) : 0;
+  return SESSION_COOKIE + '=' + (token || '') + '; Path=/api/stream; HttpOnly; SameSite=Strict; Max-Age=' + maxAge +
+    (isHttps(req) ? '; Secure' : '');
 }
 
 // Control characters (keep \n and \t) and, in names, bidi override characters
@@ -215,6 +217,27 @@ function makeLimiter(max, windowMs) {
 const joinLimiter = makeLimiter(20, 60 * 1000);      // per IP
 const sendLimiterUser = makeLimiter(5, 5 * 1000);    // per visitor
 const sendLimiterIp = makeLimiter(30, 10 * 1000);    // per IP (mobile carriers share IPs)
+// New conversations cost storage; limits are generous because many phones
+// share one IP address on mobile networks.
+const newConvLimiterIp = makeLimiter(30, 60 * 60 * 1000);
+const newConvLimiterAll = makeLimiter(300, 60 * 60 * 1000);
+
+// Wrong passwords: after 10 from one IP in 15 minutes, that IP must wait.
+const LOGIN_FAIL_MAX = 10;
+const LOGIN_FAIL_WINDOW_MS = 15 * 60 * 1000;
+const loginFailures = new Map(); // ip -> [timestamps]
+function recentFailures(ip) {
+  const now = Date.now();
+  const list = (loginFailures.get(ip) || []).filter((t) => now - t < LOGIN_FAIL_WINDOW_MS);
+  if (list.length) loginFailures.set(ip, list); else loginFailures.delete(ip);
+  return list;
+}
+function recordFailure(ip) {
+  const list = recentFailures(ip);
+  list.push(Date.now());
+  loginFailures.set(ip, list);
+}
+setInterval(() => { for (const ip of Array.from(loginFailures.keys())) recentFailures(ip); }, 60 * 1000).unref();
 
 // Remembers recent client message ids so a retried send is not duplicated.
 const recentCids = new Map();
@@ -227,7 +250,7 @@ function forgetCid(msg) {
 }
 
 function getConv(uid) {
-  return typeof uid === 'string' && Object.prototype.hasOwnProperty.call(state.convs, uid) ? state.convs[uid] : null;
+  return store.get(uid);
 }
 
 // ---------------------------------------------------------------------------
@@ -259,42 +282,43 @@ function summary(conv) {
   };
 }
 
-function createConv(user) {
-  const conv = { uid: user.uid, name: user.name, created: Date.now(), messages: [], adminRead: 0, visitorRead: 0 };
-  state.convs[user.uid] = conv;
-  // Keep storage bounded: drop the conversation that has been quiet the longest.
-  const uids = Object.keys(state.convs);
-  if (uids.length > config.maxConversations) {
-    let oldest = null;
-    for (const uid of uids) {
-      if (uid === user.uid) continue;
-      if (!oldest || lastActivity(state.convs[uid]) < lastActivity(state.convs[oldest])) oldest = uid;
-    }
-    if (oldest) removeConv(oldest);
+function oldestConvExcept(keep) {
+  let oldest = null;
+  for (const uid of store.uids()) {
+    if (uid === keep) continue;
+    if (!oldest || lastActivity(store.convs[uid]) < lastActivity(store.convs[oldest])) oldest = uid;
   }
-  return conv;
+  return oldest;
 }
 
 function removeConv(uid) {
-  for (const m of state.convs[uid].messages) forgetCid(m);
-  delete state.convs[uid];
-  state.seq += 1;
-  emit({ seq: state.seq, type: 'convdelete', conv: uid, data: { conv: uid } });
-  scheduleSave();
+  const conv = getConv(uid);
+  if (!conv) return;
+  for (const m of conv.messages) forgetCid(m);
+  const seq = store.next();
+  store.commit({ op: 'convdel', seq: seq, conv: uid });
+  emit({ seq: seq, type: 'convdelete', conv: uid, data: { conv: uid } });
 }
 
-function addMessage(conv, user, text, cid) {
-  state.seq += 1;
-  const from = user.admin ? 'admin' : 'visitor';
-  const msg = { id: state.seq, conv: conv.uid, from: from, uid: user.uid, name: user.name, text: text, ts: Date.now() };
+// Keep storage bounded: drop the conversations that have been quiet the longest.
+function enforceLimits(keep) {
+  while (store.uids().length > config.maxConversations || store.totalBytes > config.maxStorageBytes) {
+    const oldest = oldestConvExcept(keep);
+    if (!oldest) break;
+    removeConv(oldest);
+  }
+}
+
+function addMessage(uid, user, text, cid) {
+  const msg = {
+    id: store.next(), conv: uid, from: user.admin ? 'admin' : 'visitor',
+    uid: user.uid, name: user.name, text: text, ts: Date.now(),
+  };
   if (cid) msg.cid = cid;
-  conv.messages.push(msg);
-  if (conv.messages.length > config.maxHistory) conv.messages.splice(0, conv.messages.length - config.maxHistory);
-  // Whoever writes has obviously seen the conversation.
-  if (from === 'admin') conv.adminRead = msg.id;
-  else { conv.visitorRead = msg.id; conv.name = user.name; }
-  emit({ seq: msg.id, type: 'msg', conv: conv.uid, data: { message: msg, summary: summary(conv) } });
-  scheduleSave();
+  store.commit({ op: 'msg', seq: msg.id, m: msg });
+  const conv = getConv(uid);
+  emit({ seq: msg.id, type: 'msg', conv: uid, data: { message: msg, summary: summary(conv) } });
+  enforceLimits(uid);
   return msg;
 }
 
@@ -339,7 +363,7 @@ function emit(ev) {
 
 function resetPayload(client) {
   if (client.user.admin) {
-    const list = Object.keys(state.convs).map((uid) => summary(state.convs[uid]));
+    const list = store.uids().map((uid) => summary(store.convs[uid]));
     list.sort((a, b) => b.lastTs - a.lastTs);
     return { conversations: list };
   }
@@ -348,17 +372,17 @@ function resetPayload(client) {
 }
 
 function sendInitial(client, since) {
-  const firstLogged = eventLog.length ? eventLog[0].seq : state.seq + 1;
-  const canReplay = since > 0 && since <= state.seq && since >= firstLogged - 1;
+  const firstLogged = eventLog.length ? eventLog[0].seq : store.seq + 1;
+  const canReplay = since > 0 && since <= store.seq && since >= firstLogged - 1;
   if (canReplay) {
     for (const ev of eventLog) {
       if (ev.seq <= since) continue;
       const data = payloadFor(client, ev);
       if (data) sseWrite(client.res, ev.type, data, ev.seq);
     }
-    sseWrite(client.res, 'ping', Date.now(), state.seq);
+    sseWrite(client.res, 'ping', Date.now(), store.seq);
   } else {
-    sseWrite(client.res, 'reset', resetPayload(client), state.seq);
+    sseWrite(client.res, 'reset', resetPayload(client), store.seq);
   }
 }
 
@@ -398,7 +422,7 @@ function schedulePresence() {
 // The ping carries the current sequence number so every client's position
 // moves forward even when the events in between were not meant for it.
 setInterval(() => {
-  for (const c of clients) sseWrite(c.res, 'ping', Date.now(), state.seq);
+  for (const c of clients) sseWrite(c.res, 'ping', Date.now(), store.seq);
 }, PING_INTERVAL_MS).unref();
 
 // ---------------------------------------------------------------------------
@@ -475,6 +499,8 @@ function loadStaticDir(dir, prefix) {
 loadStaticDir(PUBLIC_DIR, '');
 staticFiles.set('/', staticFiles.get('/index.html'));
 
+const useTls = !!(config.tlsCert && config.tlsKey);
+
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
@@ -482,7 +508,11 @@ const SECURITY_HEADERS = {
   'Content-Security-Policy':
     "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; " +
     "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Resource-Policy': 'same-origin',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
 };
+if (useTls) SECURITY_HEADERS['Strict-Transport-Security'] = 'max-age=15552000';
 
 function serveStatic(req, res, pathname) {
   let key = pathname;
@@ -515,13 +545,13 @@ function serveStatic(req, res, pathname) {
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
-function sendJson(res, status, data) {
+function sendJson(res, status, data, extraHeaders) {
   const body = JSON.stringify(data);
   res.writeHead(status, Object.assign({
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'Content-Length': Buffer.byteLength(body),
-  }, SECURITY_HEADERS));
+  }, SECURITY_HEADERS, extraHeaders || {}));
   res.end(body);
 }
 
@@ -559,7 +589,9 @@ function readJson(req, limit) {
 }
 
 async function handleJoin(req, res) {
-  if (!joinLimiter(clientIp(req))) return sendJson(res, 429, { error: 'rate_limited' });
+  const ip = clientIp(req);
+  if (recentFailures(ip).length >= LOGIN_FAIL_MAX) return sendJson(res, 429, { error: 'too_many_attempts' });
+  if (!joinLimiter(ip)) return sendJson(res, 429, { error: 'rate_limited' });
   const body = await readJson(req);
   const name = cleanName(body.name);
   if (!name) return sendJson(res, 400, { error: 'bad_name' });
@@ -570,6 +602,8 @@ async function handleJoin(req, res) {
     admin = true;
   } else if (config.password ? !safeEqual(pw, config.password) : pw !== '') {
     // With no site password, a non-empty password can only be an admin attempt.
+    recordFailure(ip);
+    console.warn('Wrong password from ' + ip + ' (' + recentFailures(ip).length + ' in the last 15 minutes)');
     return sendJson(res, 403, { error: 'bad_password' });
   }
 
@@ -578,12 +612,24 @@ async function handleJoin(req, res) {
   const user = { uid: prev ? prev.uid : randomId(12), name: name, admin: admin };
   const conv = admin ? null : getConv(user.uid);
   if (conv && conv.name !== name) {
-    conv.name = name;
-    state.seq += 1;
-    emit({ seq: state.seq, type: 'rename', conv: conv.uid, data: { conv: conv.uid, summary: summary(conv) } });
-    scheduleSave();
+    const seq = store.next();
+    store.commit({ op: 'rename', seq: seq, conv: conv.uid, name: name });
+    emit({ seq: seq, type: 'rename', conv: conv.uid, data: { conv: conv.uid, summary: summary(conv) } });
   }
-  sendJson(res, 200, { token: makeToken(user), user: user });
+  const token = makeToken(user);
+  sendJson(res, 200, { token: token, user: user }, { 'Set-Cookie': sessionCookie(req, token, user) });
+}
+
+// Sets the stream cookie for a page that already holds a token (after a reload).
+function handleSession(req, res) {
+  const token = bearer(req);
+  const user = verifyToken(token);
+  if (!user) return sendJson(res, 401, { error: 'unauthorized' });
+  return sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, token, user) });
+}
+
+function handleLogout(req, res) {
+  return sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, '', { admin: false }) });
 }
 
 async function handleSend(req, res) {
@@ -604,12 +650,18 @@ async function handleSend(req, res) {
     conv = getConv(String(body.conv));
     if (!conv) return sendJson(res, 404, { error: 'not_found' });
   }
-  if ((!user.admin && !sendLimiterUser(user.uid)) || !sendLimiterIp(clientIp(req))) {
+  const ip = clientIp(req);
+  if ((!user.admin && !sendLimiterUser(user.uid)) || !sendLimiterIp(ip)) {
     return sendJson(res, 429, { error: 'rate_limited' });
   }
-  if (!conv) conv = getConv(user.uid) || createConv(user);
+  if (!conv) {
+    conv = getConv(user.uid);
+    if (!conv && (!newConvLimiterIp(ip) || !newConvLimiterAll('all'))) {
+      return sendJson(res, 429, { error: 'rate_limited' });
+    }
+  }
 
-  const msg = addMessage(conv, user, text, cid);
+  const msg = addMessage(conv ? conv.uid : user.uid, user, text, cid);
   if (cid) rememberCid(cidKey, msg);
   sendJson(res, 200, { message: msg });
 }
@@ -626,10 +678,9 @@ async function handleDelete(req, res) {
   if (!user.admin && conv.messages[idx].from !== 'visitor') return sendJson(res, 403, { error: 'forbidden' });
 
   forgetCid(conv.messages[idx]);
-  conv.messages.splice(idx, 1);
-  state.seq += 1;
-  emit({ seq: state.seq, type: 'delete', conv: conv.uid, data: { id: id, conv: conv.uid, summary: summary(conv) } });
-  scheduleSave();
+  const seq = store.next();
+  store.commit({ op: 'del', seq: seq, conv: conv.uid, id: id });
+  emit({ seq: seq, type: 'delete', conv: conv.uid, data: { id: id, conv: conv.uid, summary: summary(conv) } });
   sendJson(res, 200, { ok: true });
 }
 
@@ -642,13 +693,14 @@ async function handleRead(req, res) {
   const last = conv.messages.length ? conv.messages[conv.messages.length - 1].id : 0;
   const field = user.admin ? 'adminRead' : 'visitorRead';
   if (last > conv[field]) {
-    conv[field] = last;
-    state.seq += 1;
+    const seq = store.next();
+    const op = { op: 'read', seq: seq, conv: conv.uid };
+    op[field] = last;
+    store.commit(op);
     emit({
-      seq: state.seq, type: 'read', conv: conv.uid,
+      seq: seq, type: 'read', conv: conv.uid,
       data: { conv: conv.uid, adminRead: conv.adminRead, visitorRead: conv.visitorRead, summary: summary(conv) },
     });
-    scheduleSave();
   }
   sendJson(res, 200, { ok: true });
 }
@@ -674,7 +726,7 @@ function handleGetConversation(req, res, url) {
 }
 
 function handleStream(req, res, url) {
-  const user = verifyToken(url.searchParams.get('token'));
+  const user = verifyToken(cookie(req, SESSION_COOKIE));
   if (!user) return sendJson(res, 401, { error: 'unauthorized' });
 
   const ip = clientIp(req);
@@ -746,6 +798,8 @@ async function handle(req, res) {
       return sendJson(res, 415, { error: 'json_required' });
     }
     if (p === '/api/join') return handleJoin(req, res);
+    if (p === '/api/session') return handleSession(req, res);
+    if (p === '/api/logout') return handleLogout(req, res);
     if (p === '/api/send') return handleSend(req, res);
     if (p === '/api/delete') return handleDelete(req, res);
     if (p === '/api/read') return handleRead(req, res);
@@ -768,10 +822,15 @@ function onRequest(req, res) {
 // Start
 // ---------------------------------------------------------------------------
 
-const useTls = !!(config.tlsCert && config.tlsKey);
 const server = useTls
   ? https.createServer({ cert: fs.readFileSync(config.tlsCert), key: fs.readFileSync(config.tlsKey) }, onRequest)
   : http.createServer(onRequest);
+
+// Slow or half-open clients must not tie up the server (live streams are
+// unaffected: their request is complete as soon as the headers arrive).
+server.headersTimeout = 15 * 1000;
+server.requestTimeout = 30 * 1000;
+server.maxConnections = config.maxClients * 2;
 
 server.listen(config.port, config.host, () => {
   const proto = useTls ? 'https' : 'http';
@@ -795,9 +854,9 @@ server.listen(config.port, config.host, () => {
 });
 
 function shutdown() {
-  saveNow();
   for (const c of clients) c.res.end();
   server.close();
+  store.close();
   process.exit(0);
 }
 process.on('SIGINT', shutdown);

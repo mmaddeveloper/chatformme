@@ -58,9 +58,10 @@ async function call(method, url, body, token) {
 function openStream(token, lastEventId) {
   const events = [];
   const waiters = [];
-  const headers = {};
+  // The stream is authenticated by the HttpOnly session cookie, like a browser does.
+  const headers = { Cookie: 'cfm_session=' + token };
   if (lastEventId !== undefined) headers['Last-Event-ID'] = String(lastEventId);
-  const req = http.get(BASE + '/api/stream?token=' + encodeURIComponent(token), { headers });
+  const req = http.get(BASE + '/api/stream', { headers });
   let buffer = '';
   const stream = {
     events,
@@ -135,6 +136,29 @@ async function main() {
   const admin2 = (await call('POST', '/api/join', { name: 'مریم', password: 'admin-secret' })).data;
   assert.strictEqual(admin.user.admin, true);
   assert.strictEqual((await call('GET', '/api/me', undefined, 'bogus.token')).status, 401);
+
+  // ---- session cookie for the live stream ----
+  const joinRes = await fetch(BASE + '/api/join', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'کوکی', password: 'family-pass' }),
+  });
+  const setCookie = joinRes.headers.get('set-cookie');
+  assert.ok(/^cfm_session=[^;]+; Path=\/api\/stream; HttpOnly; SameSite=Strict; Max-Age=2592000$/.test(setCookie), setCookie);
+  const sessionRes = await fetch(BASE + '/api/session', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + admin.token }, body: '{}',
+  });
+  assert.ok(/Max-Age=604800/.test(sessionRes.headers.get('set-cookie')), 'admin sessions last 7 days');
+  assert.strictEqual((await call('POST', '/api/session', {})).status, 401);
+  const logoutRes = await fetch(BASE + '/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  assert.ok(/^cfm_session=; .*Max-Age=0/.test(logoutRes.headers.get('set-cookie')));
+  // A token in the URL is no longer accepted (it would end up in access logs).
+  const urlToken = await new Promise((resolve) => {
+    http.get(BASE + '/api/stream?token=' + encodeURIComponent(admin.token), (r) => { resolve(r.statusCode); r.destroy(); });
+  });
+  assert.strictEqual(urlToken, 401);
+  const headersRes = await fetch(BASE + '/api/config');
+  assert.strictEqual(headersRes.headers.get('cross-origin-opener-policy'), 'same-origin');
+  assert.ok(headersRes.headers.get('permissions-policy').includes('camera=()'));
 
   // ---- streams ----
   const bad = openStream('nope');
@@ -266,6 +290,22 @@ async function main() {
   // POST without JSON content type is refused (no cross-site form posts).
   const form = await fetch(BASE + '/api/send', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{}' });
   assert.strictEqual(form.status, 415);
+
+  // ---- wrong passwords lock that IP out for a while ----
+  let lastStatus = 0;
+  for (let i = 0; i < 12; i++) {
+    lastStatus = (await call('POST', '/api/join', { name: 'حدس', password: 'guess-' + i })).status;
+    if (lastStatus === 429) break;
+  }
+  assert.strictEqual(lastStatus, 429);
+  const locked = await call('POST', '/api/join', { name: 'مدیر', password: 'admin-secret' });
+  assert.strictEqual(locked.data.error, 'too_many_attempts', 'even the right key waits once locked out');
+
+  // ---- data files are private to the server's user ----
+  assert.strictEqual(fs.statSync(DATA_DIR).mode & 0o777, 0o700);
+  for (const name of ['journal.log', 'secret.key', 'lock']) {
+    assert.strictEqual(fs.statSync(path.join(DATA_DIR, name)).mode & 0o777, 0o600, name);
+  }
 
   // ---- persistence across a restart ----
   sAdmin.close();

@@ -85,6 +85,7 @@
     bad_password: 'رمز اشتباه است.',
     bad_name: 'نام باید بین ۱ تا ۳۲ حرف باشد.',
     rate_limited: 'درخواست‌ها زیاد است؛ چند لحظه صبر کنید.',
+    too_many_attempts: 'رمز چند بار اشتباه وارد شده؛ ۱۵ دقیقهٔ دیگر دوباره امتحان کنید.',
     too_long: 'پیام خیلی طولانی است.',
     empty: 'پیام خالی است.',
     forbidden: 'اجازهٔ این کار را ندارید.',
@@ -103,6 +104,7 @@
     token: storage.get('chat.token'),
     user: readJson('chat.user'),
     es: null,
+    sessionReady: false, // the HttpOnly cookie the live stream authenticates with
     connState: 'connecting',
     lastSeq: 0,
     lastEventAt: 0,
@@ -222,6 +224,7 @@
     api('POST', '/api/join', body).then(function (data) {
       state.token = data.token;
       state.user = data.user;
+      state.sessionReady = true; // the join response set the stream cookie
       storage.set('chat.token', data.token);
       storage.set('chat.prevToken', data.token);
       storage.set('chat.user', JSON.stringify(data.user));
@@ -276,6 +279,8 @@
 
   function logout() {
     closeStream();
+    if (state.token) api('POST', '/api/logout', {}).catch(function () {});
+    state.sessionReady = false;
     var ids = Object.keys(state.pending);
     for (var i = 0; i < ids.length; i++) clearTimeout(state.pending[ids[i]].timer);
     state.pending = {};
@@ -358,8 +363,23 @@
     closeStream();
     if (!state.token) return;
     setConn('connecting');
-    var url = '/api/stream?token=' + encodeURIComponent(state.token) + '&since=' + state.lastSeq;
-    var es = new EventSource(url);
+    if (!state.sessionReady) {
+      // After a reload the page has a token but maybe no stream cookie yet.
+      api('POST', '/api/session', {}).then(function () {
+        state.sessionReady = true;
+        if (state.token) openStream();
+      }, function (err) {
+        if (err.status === 401) handleUnauthorized(); else scheduleReconnect();
+      });
+      return;
+    }
+    openStream();
+  }
+
+  function openStream() {
+    closeStream();
+    // No token in the URL: the stream is authenticated by an HttpOnly cookie.
+    var es = new EventSource('/api/stream?since=' + state.lastSeq);
     state.es = es;
     state.lastEventAt = Date.now();
 
@@ -410,7 +430,10 @@
       if (es.readyState === 2 /* CLOSED */) {
         // The browser gave up (bad token, server full, ...). Find out why.
         setConn('offline');
-        api('GET', '/api/me').then(scheduleReconnect, function (err) {
+        api('GET', '/api/me').then(function () {
+          state.sessionReady = false; // the token is fine; refresh the cookie
+          scheduleReconnect();
+        }, function (err) {
           if (err.status === 401) handleUnauthorized(); else scheduleReconnect();
         });
       } else {

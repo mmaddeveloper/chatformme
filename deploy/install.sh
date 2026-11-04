@@ -67,7 +67,7 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 # ---------------------------------------------------------------- checks
-[ -f "$SRC_DIR/server.js" ] && [ -d "$SRC_DIR/public" ] || die "run this from a copy of the chatformme repository"
+[ -f "$SRC_DIR/server.js" ] && [ -d "$SRC_DIR/lib" ] && [ -d "$SRC_DIR/public" ] || die "run this from a copy of the chatformme repository"
 if [ -e "$APP_DIR" ] && ! ours_dir; then
   die "$APP_DIR already exists and was not created by this installer; not touching it"
 fi
@@ -161,7 +161,7 @@ mkdir -p "$APP_DIR"
 touch "$APP_DIR/.chatformme"
 rm -rf "$APP_DIR/app.new"
 mkdir -p "$APP_DIR/app.new"
-cp -r "$SRC_DIR/server.js" "$SRC_DIR/package.json" "$SRC_DIR/public" "$APP_DIR/app.new/"
+cp -r "$SRC_DIR/server.js" "$SRC_DIR/package.json" "$SRC_DIR/lib" "$SRC_DIR/public" "$APP_DIR/app.new/"
 chmod -R a+rX "$APP_DIR"
 rm -rf "$APP_DIR/app.old"
 if [ -d "$APP_DIR/app" ]; then mv "$APP_DIR/app" "$APP_DIR/app.old"; fi
