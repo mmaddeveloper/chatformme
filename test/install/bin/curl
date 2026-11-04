@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Stand-in for curl when chatformme-update talks to GitHub; everything else goes to the real curl.
+T="${CHATFORMME_ITEST:?run test/install/run.sh}"
+url="${@: -1}"; out=""
+args=("$@"); for i in "${!args[@]}"; do [ "${args[$i]}" = -o ] && out="${args[$((i+1))]}"; done
+case "$url" in
+  https://api.github.com/repos/*) printf '{\n  "sha": "%s",\n  "node_id": "x"\n}\n' "$(cat $T/next-sha)" > "$out"; exit 0 ;;
+  https://codeload.github.com/*) cp "$T/next.tar.gz" "$out"; exit 0 ;;
+esac
+exec /usr/bin/curl "$@"

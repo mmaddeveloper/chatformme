@@ -42,6 +42,7 @@ const config = {
   maxHistory: intEnv('MAX_HISTORY', 300),          // messages kept per conversation
   maxConversations: intEnv('MAX_CONVERSATIONS', 1000),
   maxStorageBytes: intEnv('MAX_STORAGE_MB', 32) * 1024 * 1024, // all conversations together
+  maxAccounts: intEnv('MAX_ACCOUNTS', 5000),
   maxConvBytes: 256 * 1024,                        // one conversation
   maxMessageLength: 2000,
   maxNameLength: 32,
@@ -50,6 +51,15 @@ const config = {
   trustProxy: process.env.TRUST_PROXY === '1',
   tlsCert: process.env.TLS_CERT || '',
   tlsKey: process.env.TLS_KEY || '',
+  // Optional plain-HTTP port (usually 80) that only answers certificate
+  // validation requests (ACME_WEBROOT) and redirects everything to HTTPS_URL.
+  httpPort: intEnv('HTTP_PORT', 0),
+  acmeWebroot: process.env.ACME_WEBROOT || '',
+  httpsUrl: (process.env.HTTPS_URL || '').replace(/\/+$/, ''),
+  // HSTS makes browsers refuse any later certificate warning, which would lock
+  // people out if the certificate ever lapses (e.g. during a long shutdown), so
+  // it is opt-in.
+  hsts: process.env.HSTS === '1',
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -122,11 +132,16 @@ const tokenKey = crypto.createHash('sha256')
 function sign(payload) {
   return b64url(crypto.createHmac('sha256', tokenKey).update(payload).digest());
 }
+// Visitor tokens carry the account's version; changing or resetting the
+// password bumps it, which signs out every other device.
 function makeToken(user) {
-  const payload = b64url(JSON.stringify({ u: user.uid, n: user.name, a: user.admin ? 1 : 0, t: Date.now() }));
+  const data = { u: user.uid, n: user.name, a: user.admin ? 1 : 0, t: Date.now() };
+  if (!user.admin) data.v = store.account(user.uid).v;
+  const payload = b64url(JSON.stringify(data));
   return payload + '.' + sign(payload);
 }
-function verifyToken(token) {
+// Checks signature and age only.
+function readToken(token) {
   if (typeof token !== 'string' || token.length > 2048) return null;
   const dot = token.indexOf('.');
   if (dot < 1) return null;
@@ -137,10 +152,19 @@ function verifyToken(token) {
     if (!d || typeof d.t !== 'number') return null;
     const ttl = d.a === 1 ? ADMIN_TOKEN_TTL_MS : VISITOR_TOKEN_TTL_MS;
     if (Date.now() - d.t > ttl || d.t > Date.now() + 60 * 1000) return null;
-    return { uid: String(d.u), name: String(d.n), admin: d.a === 1, issued: d.t };
+    return d;
   } catch (e) {
     return null;
   }
+}
+function verifyToken(token) {
+  const d = readToken(token);
+  if (!d) return null;
+  if (d.a === 1) return { uid: String(d.u), name: String(d.n), admin: true };
+  // Visitors need an account whose password has not changed since.
+  const account = store.account(String(d.u));
+  if (!account || account.v !== d.v) return null;
+  return { uid: account.uid, name: account.name, admin: false };
 }
 function bearer(req) {
   const h = req.headers.authorization || '';
@@ -221,6 +245,8 @@ const sendLimiterIp = makeLimiter(30, 10 * 1000);    // per IP (mobile carriers 
 // share one IP address on mobile networks.
 const newConvLimiterIp = makeLimiter(30, 60 * 60 * 1000);
 const newConvLimiterAll = makeLimiter(300, 60 * 60 * 1000);
+const registerLimiterIp = makeLimiter(10, 60 * 60 * 1000);
+const registerLimiterAll = makeLimiter(200, 60 * 60 * 1000);
 
 // Wrong passwords: after 10 from one IP in 15 minutes, that IP must wait.
 const LOGIN_FAIL_MAX = 10;
@@ -254,6 +280,90 @@ function getConv(uid) {
 }
 
 // ---------------------------------------------------------------------------
+// Visitor accounts: a unique username and a password (scrypt) per person
+// ---------------------------------------------------------------------------
+
+const PASSWORD_MIN = 6;
+const PASSWORD_MAX = 128;
+const SCRYPT_OPTIONS = { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 };
+const DIACRITICS_RE = /[\u064B-\u065F\u0670\u0640]/g;        // Arabic marks and tatweel
+const INVISIBLE_RE = /[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g;
+
+// The same text typed on different keyboards (Arabic or Persian yeh and kaf,
+// Persian or Latin digits) should count as the same.
+function fold(text) {
+  return String(text).normalize('NFKC')
+    .replace(INVISIBLE_RE, '')
+    .replace(/[\u064A\u0649]/g, '\u06CC')   // ي ى -> ی
+    .replace(/\u0643/g, '\u06A9')            // ك -> ک
+    .replace(/[\u06F0-\u06F9]/g, (d) => String(d.charCodeAt(0) - 0x06F0))
+    .replace(/[\u0660-\u0669]/g, (d) => String(d.charCodeAt(0) - 0x0660));
+}
+
+// Usernames that look alike map to the same key, so nobody can register a
+// near-copy of someone else's name ("علی" / "علي", "Ali.Reza" / "alireza").
+function nameKey(name) {
+  return fold(name)
+    .replace(DIACRITICS_RE, '')
+    .replace(/[\u0622\u0623\u0625\u0671]/g, '\u0627') // آ أ إ ٱ -> ا
+    .replace(/\u0629/g, '\u0647')                      // ة -> ه
+    .replace(/\u0624/g, '\u0648')                      // ؤ -> و
+    .toLowerCase()
+    .replace(/[\s._\-]+/g, '');
+}
+
+function scryptHash(password, salt) {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(fold(password), Buffer.from(salt, 'base64'), 32, SCRYPT_OPTIONS, (err, key) => {
+      if (err) reject(err); else resolve(key.toString('base64'));
+    });
+  });
+}
+async function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('base64');
+  return { salt: salt, hash: await scryptHash(password, salt) };
+}
+async function checkPassword(account, password) {
+  const hash = Buffer.from(await scryptHash(password, account.salt), 'base64');
+  const expected = Buffer.from(account.hash, 'base64');
+  return hash.length === expected.length && crypto.timingSafeEqual(hash, expected);
+}
+// Used when the username does not exist, so a miss takes as long as a wrong password.
+const DUMMY_ACCOUNT = { salt: crypto.randomBytes(16).toString('base64'), hash: crypto.randomBytes(32).toString('base64') };
+
+function validPassword(password) {
+  return typeof password === 'string' && Array.from(password).length >= PASSWORD_MIN && password.length <= PASSWORD_MAX;
+}
+
+function readablePassword() {
+  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+  let out = '';
+  for (const b of crypto.randomBytes(10)) out += chars[b % chars.length];
+  return out;
+}
+
+// Wrong passwords for one account: after 10 in 15 minutes the account waits.
+const accountFailures = new Map();
+function accountLocked(uid) {
+  const now = Date.now();
+  const list = (accountFailures.get(uid) || []).filter((t) => now - t < LOGIN_FAIL_WINDOW_MS);
+  if (list.length) accountFailures.set(uid, list); else accountFailures.delete(uid);
+  return list.length >= LOGIN_FAIL_MAX;
+}
+function recordAccountFailure(uid) {
+  accountLocked(uid);
+  const list = accountFailures.get(uid) || [];
+  list.push(Date.now());
+  accountFailures.set(uid, list);
+}
+
+// A visitor's open live streams end when their password changes or their
+// account is removed, so an old session cannot keep reading.
+function disconnectVisitor(uid) {
+  for (const c of clients) if (!c.user.admin && c.user.uid === uid) c.res.end();
+}
+
+// ---------------------------------------------------------------------------
 // Conversations
 // ---------------------------------------------------------------------------
 
@@ -276,6 +386,7 @@ function summary(conv) {
     name: conv.name,
     lastTs: lastActivity(conv),
     last: last ? { text: last.text.slice(0, 140), from: last.from } : null,
+    account: !!store.account(conv.uid),
     unread: unread,
     adminRead: conv.adminRead,
     visitorRead: conv.visitorRead,
@@ -291,13 +402,16 @@ function oldestConvExcept(keep) {
   return oldest;
 }
 
-function removeConv(uid) {
+function removeConv(uid, withAccount) {
   const conv = getConv(uid);
-  if (!conv) return;
-  for (const m of conv.messages) forgetCid(m);
+  if (!conv && !(withAccount && store.account(uid))) return;
+  if (conv) for (const m of conv.messages) forgetCid(m);
   const seq = store.next();
-  store.commit({ op: 'convdel', seq: seq, conv: uid });
+  const op = { op: 'convdel', seq: seq, conv: uid };
+  if (withAccount) op.account = true;
+  store.commit(op);
   emit({ seq: seq, type: 'convdelete', conv: uid, data: { conv: uid } });
+  if (withAccount) disconnectVisitor(uid);
 }
 
 // Keep storage bounded: drop the conversations that have been quiet the longest.
@@ -512,7 +626,7 @@ const SECURITY_HEADERS = {
   'Cross-Origin-Resource-Policy': 'same-origin',
   'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
 };
-if (useTls) SECURITY_HEADERS['Strict-Transport-Security'] = 'max-age=15552000';
+if (useTls && config.hsts) SECURITY_HEADERS['Strict-Transport-Security'] = 'max-age=15552000';
 
 function serveStatic(req, res, pathname) {
   let key = pathname;
@@ -588,36 +702,113 @@ function readJson(req, limit) {
   });
 }
 
-async function handleJoin(req, res) {
+function loginLocked(ip) {
+  return recentFailures(ip).length >= LOGIN_FAIL_MAX;
+}
+function wrongPassword(res, ip, code, what) {
+  recordFailure(ip);
+  console.warn('Wrong ' + what + ' from ' + ip + ' (' + recentFailures(ip).length + ' in the last 15 minutes)');
+  return sendJson(res, 403, { error: code });
+}
+function signedIn(req, res, user) {
+  const token = makeToken(user);
+  return sendJson(res, 200, { token: token, user: user }, { 'Set-Cookie': sessionCookie(req, token, user) });
+}
+
+async function handleRegister(req, res) {
   const ip = clientIp(req);
-  if (recentFailures(ip).length >= LOGIN_FAIL_MAX) return sendJson(res, 429, { error: 'too_many_attempts' });
+  if (loginLocked(ip)) return sendJson(res, 429, { error: 'too_many_attempts' });
+  if (!joinLimiter(ip)) return sendJson(res, 429, { error: 'rate_limited' });
+  const body = await readJson(req);
+  const name = cleanName(body.username);
+  const key = name ? nameKey(name) : '';
+  if (!name || Array.from(key).length < 2) return sendJson(res, 400, { error: 'bad_name' });
+  if (!validPassword(body.password)) return sendJson(res, 400, { error: 'weak_password' });
+  if (config.password && !safeEqual(String(body.sitePassword || ''), config.password)) {
+    return wrongPassword(res, ip, 'bad_site_password', 'site password');
+  }
+  if (store.accountByKey(key)) return sendJson(res, 409, { error: 'name_taken' });
+  if (store.accountCount() >= config.maxAccounts) return sendJson(res, 503, { error: 'full' });
+  if (!registerLimiterIp(ip) || !registerLimiterAll('all')) return sendJson(res, 429, { error: 'rate_limited' });
+
+  // A conversation started on this device before accounts existed is kept.
+  const prev = readToken(body.prevToken);
+  const claim = prev && prev.a !== 1 && typeof prev.u === 'string' && !store.account(prev.u) ? prev.u : null;
+  const uid = claim || randomId(12);
+  const pw = await hashPassword(body.password);
+  if (store.accountByKey(key) || store.account(uid)) return sendJson(res, 409, { error: 'name_taken' });
+  const seq = store.next();
+  store.commit({ op: 'account', seq: seq, uid: uid, name: name, key: key, salt: pw.salt, hash: pw.hash, created: Date.now() });
+  const conv = getConv(uid);
+  if (conv) emit({ seq: seq, type: 'rename', conv: uid, data: { conv: uid, summary: summary(conv) } });
+  return signedIn(req, res, { uid: uid, name: name, admin: false });
+}
+
+async function handleLogin(req, res) {
+  const ip = clientIp(req);
+  if (loginLocked(ip)) return sendJson(res, 429, { error: 'too_many_attempts' });
+  if (!joinLimiter(ip)) return sendJson(res, 429, { error: 'rate_limited' });
+  const body = await readJson(req);
+  const name = cleanName(body.username);
+  const account = name ? store.accountByKey(nameKey(name)) : null;
+  if (account && accountLocked(account.uid)) return sendJson(res, 429, { error: 'account_locked' });
+  const password = typeof body.password === 'string' ? body.password.slice(0, PASSWORD_MAX) : '';
+  const ok = await checkPassword(account || DUMMY_ACCOUNT, password);
+  if (!account || !ok) {
+    if (account) recordAccountFailure(account.uid);
+    return wrongPassword(res, ip, 'bad_credentials', 'password for "' + (name || '') + '"');
+  }
+  accountFailures.delete(account.uid);
+  return signedIn(req, res, { uid: account.uid, name: account.name, admin: false });
+}
+
+async function handleAdminLogin(req, res) {
+  const ip = clientIp(req);
+  if (loginLocked(ip)) return sendJson(res, 429, { error: 'too_many_attempts' });
   if (!joinLimiter(ip)) return sendJson(res, 429, { error: 'rate_limited' });
   const body = await readJson(req);
   const name = cleanName(body.name);
   if (!name) return sendJson(res, 400, { error: 'bad_name' });
-
-  const pw = typeof body.password === 'string' ? body.password : '';
-  let admin = false;
-  if (config.adminKey && pw && safeEqual(pw, config.adminKey)) {
-    admin = true;
-  } else if (config.password ? !safeEqual(pw, config.password) : pw !== '') {
-    // With no site password, a non-empty password can only be an admin attempt.
-    recordFailure(ip);
-    console.warn('Wrong password from ' + ip + ' (' + recentFailures(ip).length + ' in the last 15 minutes)');
-    return sendJson(res, 403, { error: 'bad_password' });
+  if (!config.adminKey || !safeEqual(String(body.key || ''), config.adminKey)) {
+    return wrongPassword(res, ip, 'bad_password', 'admin key');
   }
+  // The same name gets the same id on every login, so earlier replies still count as "mine".
+  const uid = 'a_' + b64url(crypto.createHash('sha256').update('admin:' + nameKey(name)).digest()).slice(0, 16);
+  return signedIn(req, res, { uid: uid, name: name, admin: true });
+}
 
-  // Keep the same identity (and so the same conversation) when re-joining.
-  const prev = verifyToken(body.prevToken);
-  const user = { uid: prev ? prev.uid : randomId(12), name: name, admin: admin };
-  const conv = admin ? null : getConv(user.uid);
-  if (conv && conv.name !== name) {
-    const seq = store.next();
-    store.commit({ op: 'rename', seq: seq, conv: conv.uid, name: name });
-    emit({ seq: seq, type: 'rename', conv: conv.uid, data: { conv: conv.uid, summary: summary(conv) } });
+async function handleChangePassword(req, res) {
+  const ip = clientIp(req);
+  const user = verifyToken(bearer(req));
+  if (!user || user.admin) return sendJson(res, 401, { error: 'unauthorized' });
+  if (loginLocked(ip) || accountLocked(user.uid)) return sendJson(res, 429, { error: 'too_many_attempts' });
+  const body = await readJson(req);
+  if (!validPassword(body.next)) return sendJson(res, 400, { error: 'weak_password' });
+  const account = store.account(user.uid);
+  if (!(await checkPassword(account, String(body.current || '').slice(0, PASSWORD_MAX)))) {
+    recordAccountFailure(user.uid);
+    return wrongPassword(res, ip, 'bad_credentials', 'current password for "' + account.name + '"');
   }
-  const token = makeToken(user);
-  sendJson(res, 200, { token: token, user: user }, { 'Set-Cookie': sessionCookie(req, token, user) });
+  const pw = await hashPassword(body.next);
+  store.commit({ op: 'passwd', seq: store.next(), uid: user.uid, salt: pw.salt, hash: pw.hash, v: account.v + 1 });
+  disconnectVisitor(user.uid); // other devices are signed out; this one gets a new token below
+  return signedIn(req, res, user);
+}
+
+// For a visitor who forgot their password: the admin gets a new one to pass on.
+async function handleResetPassword(req, res) {
+  const user = verifyToken(bearer(req));
+  if (!user) return sendJson(res, 401, { error: 'unauthorized' });
+  if (!user.admin) return sendJson(res, 403, { error: 'forbidden' });
+  const body = await readJson(req);
+  const account = store.account(String(body.conv));
+  if (!account) return sendJson(res, 404, { error: 'not_found' });
+  const password = readablePassword();
+  const pw = await hashPassword(password);
+  store.commit({ op: 'passwd', seq: store.next(), uid: account.uid, salt: pw.salt, hash: pw.hash, v: account.v + 1 });
+  accountFailures.delete(account.uid);
+  disconnectVisitor(account.uid);
+  return sendJson(res, 200, { username: account.name, password: password });
 }
 
 // Sets the stream cookie for a page that already holds a token (after a reload).
@@ -711,8 +902,8 @@ async function handleDeleteConversation(req, res) {
   if (!user.admin) return sendJson(res, 403, { error: 'forbidden' });
   const body = await readJson(req);
   const uid = String(body.conv);
-  if (!getConv(uid)) return sendJson(res, 404, { error: 'not_found' });
-  removeConv(uid);
+  if (!getConv(uid) && !store.account(uid)) return sendJson(res, 404, { error: 'not_found' });
+  removeConv(uid, true);
   sendJson(res, 200, { ok: true });
 }
 
@@ -797,7 +988,11 @@ async function handle(req, res) {
     if (!/^application\/json\b/i.test(req.headers['content-type'] || '')) {
       return sendJson(res, 415, { error: 'json_required' });
     }
-    if (p === '/api/join') return handleJoin(req, res);
+    if (p === '/api/register') return handleRegister(req, res);
+    if (p === '/api/login') return handleLogin(req, res);
+    if (p === '/api/admin/login') return handleAdminLogin(req, res);
+    if (p === '/api/account/password') return handleChangePassword(req, res);
+    if (p === '/api/admin/reset-password') return handleResetPassword(req, res);
     if (p === '/api/session') return handleSession(req, res);
     if (p === '/api/logout') return handleLogout(req, res);
     if (p === '/api/send') return handleSend(req, res);
@@ -822,9 +1017,63 @@ function onRequest(req, res) {
 // Start
 // ---------------------------------------------------------------------------
 
-const server = useTls
-  ? https.createServer({ cert: fs.readFileSync(config.tlsCert), key: fs.readFileSync(config.tlsKey) }, onRequest)
-  : http.createServer(onRequest);
+function tlsOptions() {
+  return { cert: fs.readFileSync(config.tlsCert), key: fs.readFileSync(config.tlsKey), minVersion: 'TLSv1.2' };
+}
+
+const server = useTls ? https.createServer(tlsOptions(), onRequest) : http.createServer(onRequest);
+
+// A renewed certificate is picked up on SIGHUP (systemctl reload) without
+// dropping anyone's connection.
+process.on('SIGHUP', () => {
+  if (!useTls) return;
+  try {
+    server.setSecureContext(tlsOptions());
+    console.log('Reloaded the TLS certificate.');
+  } catch (err) {
+    console.error('Could not reload the TLS certificate: ' + err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Optional plain-HTTP helper port: certificate validation and redirect to HTTPS
+// ---------------------------------------------------------------------------
+
+const ACME_PREFIX = '/.well-known/acme-challenge/';
+
+function onHttpHelper(req, res) {
+  let url;
+  try { url = new URL(req.url, 'http://localhost'); } catch (e) { url = new URL('http://localhost/'); }
+  if (url.pathname.startsWith(ACME_PREFIX) && config.acmeWebroot) {
+    const token = url.pathname.slice(ACME_PREFIX.length);
+    if (/^[A-Za-z0-9_-]{1,256}$/.test(token)) {
+      try {
+        const body = fs.readFileSync(path.join(config.acmeWebroot, ACME_PREFIX, token));
+        res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Length': body.length, 'Cache-Control': 'no-store' });
+        return res.end(body);
+      } catch (e) { /* fall through to 404 */ }
+    }
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    return res.end('not found');
+  }
+  if (config.httpsUrl) {
+    res.writeHead(301, { Location: config.httpsUrl + url.pathname + url.search, 'Content-Type': 'text/plain' });
+    return res.end('moved to ' + config.httpsUrl);
+  }
+  res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' });
+  return res.end('HTTPS is being set up; try again in a minute.');
+}
+
+if (config.httpPort) {
+  const helper = http.createServer(onHttpHelper);
+  helper.headersTimeout = 10 * 1000;
+  helper.requestTimeout = 10 * 1000;
+  helper.on('error', (err) => {
+    console.error('Could not listen on HTTP port ' + config.httpPort + ': ' + err.message);
+    process.exit(1);
+  });
+  helper.listen(config.httpPort, config.host);
+}
 
 // Slow or half-open clients must not tie up the server (live streams are
 // unaffected: their request is complete as soon as the headers arrive).

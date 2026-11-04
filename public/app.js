@@ -82,8 +82,15 @@
   }
 
   var ERRORS = {
-    bad_password: 'رمز اشتباه است.',
-    bad_name: 'نام باید بین ۱ تا ۳۲ حرف باشد.',
+    bad_password: 'کلید مدیر اشتباه است.',
+    bad_name: 'نام باید بین ۲ تا ۳۲ حرف باشد.',
+    bad_credentials: 'نام کاربری یا رمز اشتباه است.',
+    bad_site_password: 'رمز سایت اشتباه است.',
+    name_taken: 'این نام کاربری (یا نامی خیلی شبیه به آن) قبلاً گرفته شده. اگر حساب شماست، از «ورود» وارد شوید.',
+    weak_password: 'رمز باید حداقل ۶ حرف باشد.',
+    password_mismatch: 'دو رمزی که نوشتید یکی نیستند.',
+    account_locked: 'برای این حساب چند بار رمز اشتباه وارد شده؛ ۱۵ دقیقهٔ دیگر دوباره امتحان کنید.',
+    full: 'ظرفیت حساب‌های این سایت پر شده است.',
     rate_limited: 'درخواست‌ها زیاد است؛ چند لحظه صبر کنید.',
     too_many_attempts: 'رمز چند بار اشتباه وارد شده؛ ۱۵ دقیقهٔ دیگر دوباره امتحان کنید.',
     too_long: 'پیام خیلی طولانی است.',
@@ -179,23 +186,48 @@
   }
 
   // ---------- join screen ----------
+  // Modes: 'login' and 'register' for visitors, 'admin' for the site's admins.
 
-  function showJoin(message) {
+  var joinMode = 'login';
+  var JOIN_TEXT = {
+    login: { sub: 'برای فرستادن پیام به ما وارد شوید، یا اگر بار اول است حساب بسازید.', btn: 'ورود', user: 'نام کاربری', pass: 'رمز عبور' },
+    register: { sub: 'یک نام کاربری و رمز برای خودتان انتخاب کنید تا فقط خودتان به پیام‌هایتان دسترسی داشته باشید.', btn: 'ساخت حساب', user: 'نام کاربری', pass: 'رمز عبور (حداقل ۶ حرف)' },
+    admin: { sub: 'ورود مدیر سایت', btn: 'ورود مدیر', user: 'نام شما', pass: 'کلید مدیر' }
+  };
+
+  function setJoinMode(mode) {
+    joinMode = mode;
+    var t = JOIN_TEXT[mode];
+    $('join-sub').textContent = t.sub;
+    $('join-btn').textContent = t.btn;
+    $('username-label').textContent = t.user;
+    $('password-label').textContent = t.pass;
+    $('mode-tabs').hidden = mode === 'admin';
+    $('tab-login').setAttribute('aria-selected', String(mode === 'login'));
+    $('tab-register').setAttribute('aria-selected', String(mode === 'register'));
+    $('password2-row').hidden = mode !== 'register';
+    $('site-password-row').hidden = mode !== 'register' || !state.config.passwordRequired;
+    $('join-hint').hidden = mode !== 'register';
+    $('password').autocomplete = mode === 'register' ? 'new-password' : mode === 'admin' ? 'off' : 'current-password';
+    $('admin-toggle').textContent = mode === 'admin' ? 'بازگشت به ورود عادی' : 'ورود مدیر';
+    $('admin-toggle').hidden = mode !== 'admin' && !state.config.adminEnabled;
+    showJoinError('');
+  }
+
+  function showJoin(message, mode) {
     closeStream();
     $('chat').hidden = true;
     $('join').hidden = false;
     setConn('online');
     document.title = state.baseTitle;
-    var lastName = storage.get('chat.name');
-    if (lastName && !$('name').value) $('name').value = lastName;
-    // Undo "admin login" mode from a previous session on this device.
-    $('password-label').textContent = 'رمز ورود';
-    $('join-btn').textContent = 'شروع گفتگو';
     $('password').value = '';
-    $('password-row').hidden = !state.config.passwordRequired;
-    $('admin-toggle').hidden = state.config.passwordRequired || !state.config.adminEnabled;
+    $('password2').value = '';
+    $('site-password').value = '';
+    var lastName = storage.get('chat.name');
+    if (lastName && !$('username').value) $('username').value = lastName;
+    setJoinMode(mode || (storage.get('chat.hasAccount') ? 'login' : 'register'));
     showJoinError(message || '');
-    if (!isTouch) setTimeout(function () { $('name').focus(); }, 0);
+    if (!isTouch) setTimeout(function () { ($('username').value ? $('password') : $('username')).focus(); }, 0);
   }
 
   function showJoinError(text) {
@@ -203,33 +235,67 @@
     $('join-error').hidden = !text;
   }
 
+  $('tab-login').addEventListener('click', function () { setJoinMode('login'); });
+  $('tab-register').addEventListener('click', function () { setJoinMode('register'); });
   $('admin-toggle').addEventListener('click', function () {
-    $('password-label').textContent = 'کلید مدیر';
-    $('password-row').hidden = false;
-    $('admin-toggle').hidden = true;
-    $('join-btn').textContent = 'ورود';
-    $('password').focus();
+    setJoinMode(joinMode === 'admin' ? 'login' : 'admin');
+    $('username').focus();
   });
+
+  // Show/hide password buttons.
+  Array.prototype.forEach.call(document.querySelectorAll('.reveal'), function (btn) {
+    btn.addEventListener('click', function () {
+      var field = $(btn.getAttribute('data-for'));
+      var show = field.type === 'password';
+      field.type = show ? 'text' : 'password';
+      btn.setAttribute('aria-pressed', String(show));
+      btn.setAttribute('aria-label', show ? 'پنهان کردن رمز' : 'نمایش رمز');
+      btn.querySelector('use').setAttribute('href', show ? '#i-eye-off' : '#i-eye');
+      if ($('password2')) $('password2').type = field.type;
+    });
+  });
+
+  function rememberSession(data) {
+    state.token = data.token;
+    state.user = data.user;
+    state.sessionReady = true; // the response also set the stream cookie
+    storage.set('chat.token', data.token);
+    storage.set('chat.user', JSON.stringify(data.user));
+    if (!data.user.admin) {
+      storage.set('chat.name', data.user.name);
+      storage.set('chat.hasAccount', '1');
+      storage.del('chat.prevToken'); // an older conversation, if any, now belongs to the account
+    }
+  }
 
   $('join-form').addEventListener('submit', function (e) {
     e.preventDefault();
-    var name = $('name').value.trim();
-    if (!name) { showJoinError(ERRORS.bad_name); $('name').focus(); return; }
+    var name = $('username').value.trim();
+    var password = $('password').value;
+    if (Array.from(name).length < 2) { showJoinError(ERRORS.bad_name); $('username').focus(); return; }
+    var url;
+    var body;
+    if (joinMode === 'admin') {
+      url = '/api/admin/login';
+      body = { name: name, key: password };
+    } else if (joinMode === 'register') {
+      if (Array.from(password).length < 6) { showJoinError(ERRORS.weak_password); $('password').focus(); return; }
+      if (password !== $('password2').value) { showJoinError(ERRORS.password_mismatch); $('password2').focus(); return; }
+      url = '/api/register';
+      body = { username: name, password: password, sitePassword: $('site-password').value, prevToken: storage.get('chat.prevToken') || undefined };
+    } else {
+      url = '/api/login';
+      body = { username: name, password: password };
+    }
     var btn = $('join-btn');
     btn.disabled = true;
     showJoinError('');
-    var body = { name: name, password: $('password').value, prevToken: storage.get('chat.prevToken') || undefined };
     var oldToken = state.token;
-    state.token = null; // never send a stale token while joining
-    api('POST', '/api/join', body).then(function (data) {
-      state.token = data.token;
-      state.user = data.user;
-      state.sessionReady = true; // the join response set the stream cookie
-      storage.set('chat.token', data.token);
-      storage.set('chat.prevToken', data.token);
-      storage.set('chat.user', JSON.stringify(data.user));
-      storage.set('chat.name', data.user.name);
+    state.token = null; // never send a stale token while signing in
+    api('POST', url, body).then(function (data) {
+      rememberSession(data);
       $('password').value = '';
+      $('password2').value = '';
       startApp();
     }, function (err) {
       state.token = oldToken;
@@ -261,7 +327,7 @@
     state.unread = 0;
     app.classList.remove('conv-open');
     $('conv-delete').hidden = !isAdmin();
-    $('visitor-logout').hidden = isAdmin();
+    $('account-btn').hidden = isAdmin();
     if (isAdmin()) {
       setAvatar($('me-avatar'), state.user.uid, state.user.name);
       $('me-name').textContent = state.user.name;
@@ -295,15 +361,20 @@
 
   function confirmLogout() {
     var msg = isAdmin() ? 'از حساب مدیر خارج می‌شوید؟'
-      : 'خارج می‌شوید؟ با ورود دوباره از همین دستگاه، گفتگوی شما سر جایش است.';
-    if (window.confirm(msg)) logout();
+      : 'از حساب خارج می‌شوید؟ برای برگشتن، نام کاربری و رمزتان را لازم دارید.';
+    if (window.confirm(msg)) {
+      closeAccount();
+      logout();
+    }
   }
   $('logout-btn').addEventListener('click', confirmLogout);
   $('visitor-logout').addEventListener('click', confirmLogout);
 
   function handleUnauthorized() {
+    var wasAdmin = isAdmin();
+    closeAccount();
     logout();
-    showJoinError('نشست شما منقضی شده یا رمز تغییر کرده؛ لطفاً دوباره وارد شوید.');
+    showJoin('نشست شما تمام شده (یا رمز عوض شده)؛ لطفاً دوباره وارد شوید.', wasAdmin ? 'admin' : 'login');
   }
 
   function renderTopbar() {
@@ -316,6 +387,7 @@
       online = !!state.onlineVisitors[c.uid];
       $('chat-title').textContent = c.name;
       $('chat-title').title = c.name;
+      $('reset-password').hidden = !c.account;
       setAvatar($('top-avatar'), c.uid, c.name, online);
       $('top-avatar').hidden = false;
       text = online ? 'آنلاین' : 'آفلاین';
@@ -688,10 +760,67 @@
   $('conv-delete').addEventListener('click', function () {
     var c = state.convs[state.openConv];
     if (!c) return;
-    if (!window.confirm('کل گفتگو با «' + c.name + '» برای همیشه حذف شود؟')) return;
+    if (!window.confirm('«' + c.name + '» و همهٔ پیام‌هایش برای همیشه حذف شود؟ حساب کاربری‌اش هم حذف می‌شود.')) return;
     api('POST', '/api/conversation/delete', { conv: c.uid }).then(function () {
       delete state.convs[c.uid];
       closeConversation();
+    }, function (err) {
+      if (err.status === 401) handleUnauthorized(); else window.alert(errorText(err));
+    });
+  });
+
+  // ---------- visitor account ----------
+
+  var dialog = $('account-dialog');
+  function openAccount() {
+    $('account-name').textContent = state.user.name;
+    $('current-password').value = '';
+    $('new-password').value = '';
+    $('new-password2').value = '';
+    setPasswordMsg('', false);
+    if (dialog.showModal) dialog.showModal(); else dialog.setAttribute('open', '');
+    if (!isTouch) $('current-password').focus();
+  }
+  function closeAccount() {
+    if (!dialog.hasAttribute('open')) return;
+    if (dialog.close) dialog.close(); else dialog.removeAttribute('open');
+  }
+  function setPasswordMsg(text, ok) {
+    var box = $('password-msg');
+    box.textContent = text;
+    box.hidden = !text;
+    box.className = ok ? 'form-ok' : 'form-error';
+  }
+  $('account-btn').addEventListener('click', openAccount);
+  $('account-close').addEventListener('click', closeAccount);
+  dialog.addEventListener('click', function (e) { if (e.target === dialog) closeAccount(); });
+
+  $('password-form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var next = $('new-password').value;
+    if (Array.from(next).length < 6) { setPasswordMsg(ERRORS.weak_password, false); return; }
+    if (next !== $('new-password2').value) { setPasswordMsg(ERRORS.password_mismatch, false); return; }
+    var btn = $('password-btn');
+    btn.disabled = true;
+    api('POST', '/api/account/password', { current: $('current-password').value, next: next }).then(function (data) {
+      rememberSession(data);
+      $('current-password').value = '';
+      $('new-password').value = '';
+      $('new-password2').value = '';
+      setPasswordMsg('رمز عوض شد. از دستگاه‌های دیگر خارج شدید.', true);
+    }, function (err) {
+      if (err.status === 401) { handleUnauthorized(); return; }
+      setPasswordMsg(errorText(err), false);
+    }).then(function () { btn.disabled = false; });
+  });
+
+  // Admin: a new password for a visitor who forgot theirs.
+  $('reset-password').addEventListener('click', function () {
+    var c = state.convs[state.openConv];
+    if (!c) return;
+    if (!window.confirm('برای «' + c.name + '» رمز تازه ساخته شود؟ رمز فعلی‌اش دیگر کار نمی‌کند و از همهٔ دستگاه‌ها خارج می‌شود.')) return;
+    api('POST', '/api/admin/reset-password', { conv: c.uid }).then(function (data) {
+      window.prompt('رمز تازهٔ «' + data.username + '» — آن را برایش بفرستید:', data.password);
     }, function (err) {
       if (err.status === 401) handleUnauthorized(); else window.alert(errorText(err));
     });
@@ -1140,7 +1269,19 @@
   }
 
   loadConfig(0).then(function () {
-    if (state.token && state.user) startApp();
-    else showJoin();
+    if (state.token && state.user && !state.user.admin && !storage.get('chat.hasAccount')) {
+      // A session from before accounts existed: choosing a username and password
+      // keeps that conversation.
+      storage.set('chat.prevToken', state.token);
+      state.token = null;
+      state.user = null;
+      storage.del('chat.token');
+      storage.del('chat.user');
+      showJoin('برای ادامهٔ گفتگوی قبلی‌تان، یک نام کاربری و رمز برای خودتان بسازید.', 'register');
+    } else if (state.token && state.user) {
+      startApp();
+    } else {
+      showJoin();
+    }
   });
 })();

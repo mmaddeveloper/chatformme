@@ -21,6 +21,7 @@ const ENV = Object.assign({}, process.env, {
   CHAT_PASSWORD: 'family-pass',
   ADMIN_KEY: 'admin-secret',
   CHAT_TITLE: 'تست <چت>',
+  TRUST_PROXY: '1', // lets each test act as a different client IP
 });
 
 let server;
@@ -46,8 +47,12 @@ function stopServer() {
   });
 }
 
+// Requests come from this (pretend) client IP unless a test changes it.
+let clientIp = '10.0.0.1';
+function asClient(ip) { clientIp = ip; }
+
 async function call(method, url, body, token) {
-  const headers = {};
+  const headers = { 'X-Forwarded-For': clientIp };
   if (token) headers.Authorization = 'Bearer ' + token;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const res = await fetch(BASE + url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -125,22 +130,39 @@ async function main() {
   const cfg = await call('GET', '/api/config');
   assert.deepStrictEqual([cfg.data.passwordRequired, cfg.data.adminEnabled], [true, true]);
 
-  // ---- joining ----
-  assert.strictEqual((await call('POST', '/api/join', { name: 'علی', password: 'wrong' })).status, 403);
-  assert.strictEqual((await call('POST', '/api/join', { name: '   ', password: 'family-pass' })).data.error, 'bad_name');
-  const ali = (await call('POST', '/api/join', { name: '  علی‮  ', password: 'family-pass' })).data;
+  // ---- accounts ----
+  const reg = (username, password, extra) =>
+    call('POST', '/api/register', Object.assign({ username, password, sitePassword: 'family-pass' }, extra || {}));
+  assert.strictEqual((await reg('علی', 'pass-ali-1', { sitePassword: 'wrong' })).data.error, 'bad_site_password');
+  assert.strictEqual((await reg('   ', 'pass-ali-1')).data.error, 'bad_name');
+  assert.strictEqual((await reg('علی', '12345')).data.error, 'weak_password');
+  const ali = (await reg('  علی\u202E  ', 'رمز-علی-۱۲۳')).data;
   assert.strictEqual(ali.user.name, 'علی');
   assert.strictEqual(ali.user.admin, false);
-  const sara = (await call('POST', '/api/join', { name: 'سارا', password: 'family-pass' })).data;
-  const admin = (await call('POST', '/api/join', { name: 'محمد', password: 'admin-secret' })).data;
-  const admin2 = (await call('POST', '/api/join', { name: 'مریم', password: 'admin-secret' })).data;
+  // Look-alike names count as taken: Arabic yeh, letter case, dots and spaces.
+  assert.strictEqual((await reg('علي', 'another-pass')).data.error, 'name_taken');
+  const sara = (await reg('Sara.M', 'pass-sara-1')).data;
+  assert.strictEqual((await reg('sara m', 'another-pass')).data.error, 'name_taken');
+  const admin = (await call('POST', '/api/admin/login', { name: 'محمد', key: 'admin-secret' })).data;
+  const admin2 = (await call('POST', '/api/admin/login', { name: 'مریم', key: 'admin-secret' })).data;
   assert.strictEqual(admin.user.admin, true);
+  assert.strictEqual((await call('POST', '/api/admin/login', { name: 'x', key: 'nope' })).data.error, 'bad_password');
   assert.strictEqual((await call('GET', '/api/me', undefined, 'bogus.token')).status, 401);
 
+  // Logging in from another device reaches the same account, whatever the keyboard:
+  // the password was set with Persian digits and is typed here with Latin ones and Arabic yeh.
+  asClient('10.0.0.2');
+  const aliPhone = await call('POST', '/api/login', { username: 'علي', password: 'رمز-علي-123' });
+  assert.strictEqual(aliPhone.status, 200);
+  assert.strictEqual(aliPhone.data.user.uid, ali.user.uid);
+  assert.strictEqual((await call('POST', '/api/login', { username: 'علی', password: 'wrong-pass' })).data.error, 'bad_credentials');
+  assert.strictEqual((await call('POST', '/api/login', { username: 'nobody', password: 'wrong-pass' })).data.error, 'bad_credentials');
+  asClient('10.0.0.1');
+
   // ---- session cookie for the live stream ----
-  const joinRes = await fetch(BASE + '/api/join', {
+  const joinRes = await fetch(BASE + '/api/register', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: 'کوکی', password: 'family-pass' }),
+    body: JSON.stringify({ username: 'کوکی', password: 'cookie-pass', sitePassword: 'family-pass' }),
   });
   const setCookie = joinRes.headers.get('set-cookie');
   assert.ok(/^cfm_session=[^;]+; Path=\/api\/stream; HttpOnly; SameSite=Strict; Max-Age=2592000$/.test(setCookie), setCookie);
@@ -261,12 +283,22 @@ async function main() {
   assert.notStrictEqual(ghostRetry.data.message.id, ghost.data.message.id);
   await call('POST', '/api/delete', { id: ghostRetry.data.message.id }, ali.token);
 
-  // Re-joining under a new name updates the admins' inbox right away.
-  await call('POST', '/api/join', { name: 'علی رضایی', password: 'family-pass', prevToken: ali.token });
-  for (;;) {
-    const ev = await sAdmin.next('rename');
-    if (ev.data.conv === ali.user.uid) { assert.strictEqual(ev.data.summary.name, 'علی رضایی'); break; }
-  }
+  // Changing the password signs out every other session of that account.
+  assert.strictEqual((await call('POST', '/api/account/password', { current: 'wrong-pass', next: 'new-pass-ali' }, ali.token)).data.error, 'bad_credentials');
+  const changed = await call('POST', '/api/account/password', { current: 'رمز-علی-۱۲۳', next: 'new-pass-ali' }, ali.token);
+  assert.strictEqual(changed.status, 200);
+  assert.strictEqual((await call('GET', '/api/me', undefined, aliPhone.data.token)).status, 401, 'other device signed out');
+  assert.strictEqual((await call('GET', '/api/me', undefined, changed.data.token)).status, 200);
+  ali.token = changed.data.token;
+
+  // An admin can give a visitor who forgot their password a new one.
+  assert.strictEqual((await call('POST', '/api/admin/reset-password', { conv: sara.user.uid }, sara.token)).status, 403);
+  const reset = await call('POST', '/api/admin/reset-password', { conv: sara.user.uid }, admin.token);
+  assert.ok(/^[a-z2-9]{10}$/.test(reset.data.password));
+  assert.strictEqual((await call('GET', '/api/me', undefined, sara.token)).status, 401);
+  const saraAgain = await call('POST', '/api/login', { username: 'sara.m', password: reset.data.password });
+  assert.strictEqual(saraAgain.data.user.uid, sara.user.uid);
+  sara.token = saraAgain.data.token;
 
   // ---- reconnecting only replays what was missed (and only this visitor's) ----
   const lastId = Number(sAli.events.filter((e) => e.id).pop().id);
@@ -291,15 +323,27 @@ async function main() {
   const form = await fetch(BASE + '/api/send', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{}' });
   assert.strictEqual(form.status, 415);
 
-  // ---- wrong passwords lock that IP out for a while ----
+  // ---- guessing: an account locks after 10 wrong passwords, even from many IPs ----
+  // (Ali's account went with his conversation above.)
+  assert.strictEqual((await call('POST', '/api/login', { username: 'علی', password: 'new-pass-ali' })).data.error, 'bad_credentials');
+  for (let i = 0; i < 10; i++) {
+    asClient('10.1.0.' + i);
+    assert.strictEqual((await call('POST', '/api/login', { username: 'sara.m', password: 'guess-' + i })).data.error, 'bad_credentials');
+  }
+  asClient('10.1.1.1');
+  assert.strictEqual((await call('POST', '/api/login', { username: 'sara.m', password: reset.data.password })).data.error, 'account_locked');
+
+  // ---- guessing: one IP is locked out after 10 wrong passwords of any kind ----
+  asClient('10.2.0.1');
   let lastStatus = 0;
   for (let i = 0; i < 12; i++) {
-    lastStatus = (await call('POST', '/api/join', { name: 'حدس', password: 'guess-' + i })).status;
+    lastStatus = (await call('POST', '/api/admin/login', { name: 'حدس', key: 'guess-' + i })).status;
     if (lastStatus === 429) break;
   }
   assert.strictEqual(lastStatus, 429);
-  const locked = await call('POST', '/api/join', { name: 'مدیر', password: 'admin-secret' });
+  const locked = await call('POST', '/api/admin/login', { name: 'مدیر', key: 'admin-secret' });
   assert.strictEqual(locked.data.error, 'too_many_attempts', 'even the right key waits once locked out');
+  asClient('10.0.0.1');
 
   // ---- data files are private to the server's user ----
   assert.strictEqual(fs.statSync(DATA_DIR).mode & 0o777, 0o700);

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+T="${CHATFORMME_ITEST:?run test/install/run.sh}"
+echo "systemctl $*" >> $T/calls.log
+UNIT=/etc/systemd/system/chatformme.service
+PIDF=$T/app.pid
+alive() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
+stop() {
+  if alive; then kill "$(cat "$PIDF")"; for _ in $(seq 1 30); do alive || break; sleep 0.1; done; fi
+  rm -f "$PIDF"
+}
+start() {
+  exe="$(grep '^ExecStart=' "$UNIT" | cut -d= -f2-)"
+  (
+    set -a
+    while IFS= read -r line; do export "${line#Environment=}"; done < <(grep '^Environment=' "$UNIT")
+    while IFS= read -r f; do . "$f"; done < <(grep '^EnvironmentFile=' "$UNIT" | cut -d= -f2-)
+    set +a
+    mkdir -p "$DATA_DIR"
+    nohup $exe >> "$T/app.log" 2>&1 &
+    echo $! > "$PIDF"
+  )
+}
+case "$1" in
+  show) if alive; then cat "$PIDF"; else echo 0; fi ;;
+  restart|start) if [ "$2" = chatformme ]; then stop; start; fi ;;
+  reload) if [ "$2" = chatformme ] && alive; then kill -HUP "$(cat "$PIDF")"; fi ;;
+  stop) if [ "$2" = chatformme ]; then stop; fi ;;
+  disable) if [ "$2" = --now ]; then stop; fi ;;
+esac
+exit 0

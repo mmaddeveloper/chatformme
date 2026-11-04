@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Stand-in for the nginx command: -t fails if any site contains BROKEN (or ssl when NGINX_REJECT_SSL=1).
+T="${CHATFORMME_ITEST:?run test/install/run.sh}"
+echo "nginx $*" >> $T/calls.log
+case "$1" in
+  -t) if grep -l BROKEN /etc/nginx/conf.d/*.conf >/dev/null 2>&1; then exit 1; fi
+      if [ -n "${NGINX_REJECT_SSL:-}" ] && grep -l ssl_certificate /etc/nginx/conf.d/*.conf >/dev/null 2>&1; then exit 1; fi
+      exit 0 ;;
+  -T) echo "# configuration file /etc/nginx/nginx.conf:"; echo "http {"; echo "    include /etc/nginx/conf.d/*.conf;"; echo "}"
+      for f in /etc/nginx/conf.d/*.conf; do [ -f "$f" ] && { echo "# configuration file $f:"; cat "$f"; }; done; exit 0 ;;
+esac

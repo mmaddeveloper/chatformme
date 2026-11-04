@@ -6,7 +6,7 @@
   "private": true,
   "scripts": {
     "start": "node server.js",
-    "test": "node test/smoke.js && node test/storage.js"
+    "test": "node test/smoke.js && node test/storage.js && node test/https.js"
   },
   "engines": {
     "node": ">=16"

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Stand-in for certbot: validates over port 80 like Let's Encrypt, then issues from a test CA.
+T="${CHATFORMME_ITEST:?run test/install/run.sh}"
+echo "certbot $*" >> $T/calls.log
+cmd="$1"; shift
+domain=""; webroot=""; hook=""; name=""
+while [ $# -gt 0 ]; do case "$1" in -d) domain="$2"; shift;; -w) webroot="$2"; shift;; --deploy-hook) hook="$2"; shift;; --cert-name) name="$2"; shift;; esac; shift; done
+if [ "$cmd" = delete ]; then rm -rf "/etc/letsencrypt/live/$name"; exit 0; fi
+[ -n "${CERTBOT_FAIL:-}" ] && { echo "Challenge failed for $domain" >&2; exit 1; }
+tok="tok$RANDOM$RANDOM"
+echo "$tok.keyauth" > "$webroot/.well-known/acme-challenge/$tok"
+got="$(curl -s -H "Host: $domain" "http://127.0.0.1/.well-known/acme-challenge/$tok")"
+rm -f "$webroot/.well-known/acme-challenge/$tok"
+[ "$got" = "$tok.keyauth" ] || { echo "validation failed: got '$got'" >&2; exit 1; }
+live="/etc/letsencrypt/live/$domain"; mkdir -p "$live"
+openssl req -newkey rsa:2048 -nodes -subj "/CN=$domain" -keyout "$live/privkey.pem" -out "$T/leaf.csr" >/dev/null 2>&1
+printf 'subjectAltName=DNS:%s\n' "$domain" > "$T/leaf.ext"
+openssl x509 -req -in "$T/leaf.csr" -CA "$T/ca/ca.pem" -CAkey "$T/ca/ca.key" -CAcreateserial -days ${DAYS:-20} -extfile "$T/leaf.ext" -out "$live/fullchain.pem" >/dev/null 2>&1
+[ -n "$hook" ] && RENEWED_LINEAGE="$live" "$hook"
+echo "Successfully received certificate."

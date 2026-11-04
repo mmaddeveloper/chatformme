@@ -9,6 +9,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const { Store } = require('../lib/store');
 
 const quiet = { log() {}, warn() {}, error() {} };
@@ -111,6 +112,31 @@ function unitTests() {
   assert.strictEqual(s.totalBytes, s.get('z').bytes);
   s.close();
 
+  // Accounts are stored and survive a restart; usernames stay unique.
+  const dir5 = tmpDir();
+  s = new Store(dir5, { log: quiet }).open();
+  s.commit({ op: 'account', seq: s.next(), uid: 'u1', name: 'Sara', key: 'sara', salt: 's1', hash: 'h1', created: 1 });
+  assert.throws(() => s.commit({ op: 'account', seq: s.next(), uid: 'u2', name: 'sara', key: 'sara', salt: 's', hash: 'h', created: 2 }));
+  s.commit(msgOp(s, 'u1', 'visitor', 'hi'));
+  s.commit({ op: 'passwd', seq: s.next(), uid: 'u1', salt: 's2', hash: 'h2', v: 2 });
+  s.compact();
+  s.commit({ op: 'account', seq: s.next(), uid: 'u3', name: 'Reza', key: 'reza', salt: 's3', hash: 'h3', created: 3 });
+  s.close();
+  s = new Store(dir5, { log: quiet }).open();
+  assert.deepStrictEqual([s.account('u1').hash, s.account('u1').v], ['h2', 2]);
+  assert.strictEqual(s.accountByKey('reza').uid, 'u3');
+  assert.strictEqual(s.accountByKey('__proto__'), null);
+  // Automatic clean-up keeps the account; an admin removing the person does not.
+  s.commit({ op: 'convdel', seq: s.next(), conv: 'u1' });
+  assert.ok(s.account('u1'));
+  s.commit({ op: 'convdel', seq: s.next(), conv: 'u1', account: true });
+  assert.strictEqual(s.account('u1'), null);
+  assert.strictEqual(s.accountByKey('sara'), null);
+  s.close();
+  s = new Store(dir5, { log: quiet }).open();
+  assert.strictEqual(s.accountCount(), 1);
+  s.close();
+
   // Files are private.
   assert.strictEqual(fs.statSync(dir).mode & 0o777, 0o700);
   assert.strictEqual(fs.statSync(path.join(dir, 'journal.log')).mode & 0o777, 0o600);
@@ -157,7 +183,7 @@ async function serverTests() {
   const dataDir = tmpDir();
   let srv = runServer(dataDir);
   await srv.ready;
-  const visitor = (await post(srv.base, '/api/join', { name: 'سارا' })).data;
+  const visitor = (await post(srv.base, '/api/register', { username: 'سارا', password: 'sara-pass' })).data;
   const sent = await post(srv.base, '/api/send', { text: 'پیام مهم' }, visitor.token);
   assert.strictEqual(sent.status, 200);
   srv.child.kill('SIGKILL');
@@ -166,7 +192,7 @@ async function serverTests() {
   // The lock left behind by the killed server does not block a restart...
   srv = runServer(dataDir);
   await srv.ready;
-  const admin = (await post(srv.base, '/api/join', { name: 'مدیر', password: 'admin-secret-key' })).data;
+  const admin = (await post(srv.base, '/api/admin/login', { name: 'مدیر', key: 'admin-secret-key' })).data;
   const conv = await fetch(srv.base + '/api/conversation?conv=' + visitor.user.uid, { headers: { Authorization: 'Bearer ' + admin.token } });
   assert.strictEqual(conv.status, 200);
   assert.deepStrictEqual((await conv.json()).messages.map((m) => m.text), ['پیام مهم']);
@@ -205,6 +231,21 @@ async function serverTests() {
   // New ids continue after the migrated ones.
   const reply = await post(srv.base, '/api/send', { text: 'جدید', conv: 'oldvisitor' }, admin.token);
   assert.strictEqual(reply.data.message.id, 3);
+
+  // The visitor of an old conversation (from before accounts existed) still
+  // has its session on their phone; that session alone no longer gets in...
+  const secret = fs.readFileSync(path.join(legacyDir, 'secret.key'), 'utf8').trim();
+  const key = crypto.createHash('sha256').update(secret + '\0' + '' + '\0' + 'admin-secret-key').digest();
+  const b64 = (b) => Buffer.from(b).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const payload = b64(JSON.stringify({ u: 'oldvisitor', n: 'رضا', a: 0, t: Date.now() }));
+  const legacyToken = payload + '.' + b64(crypto.createHmac('sha256', key).update(payload).digest());
+  const me = await fetch(srv.base + '/api/me', { headers: { Authorization: 'Bearer ' + legacyToken } });
+  assert.strictEqual(me.status, 401);
+  // ...but choosing a username and password keeps their conversation.
+  const claimed = await post(srv.base, '/api/register', { username: 'رضا', password: 'reza-pass', prevToken: legacyToken });
+  assert.strictEqual(claimed.data.user.uid, 'oldvisitor');
+  const again = await post(srv.base, '/api/register', { username: 'رضا۲', password: 'reza-pass', prevToken: legacyToken });
+  assert.notStrictEqual(again.data.user.uid, 'oldvisitor', 'a conversation can only be claimed once');
   srv.child.kill('SIGTERM');
   await exited(srv.child);
 

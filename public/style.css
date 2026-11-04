@@ -305,6 +305,85 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
 }
 
 .join-card .btn-primary { margin-top: 6px; }
+
+.field label small { font-weight: normal; color: var(--muted); }
+
+.form-hint { margin: 0; color: var(--muted); font-size: 0.84rem; line-height: 1.7; }
+.form-ok {
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.9rem;
+}
+
+/* Login / create account switch */
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.tabs button {
+  flex: 1;
+  height: 40px;
+  border-radius: 10px;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.95rem;
+  transition: background-color 150ms ease, color 150ms ease, transform 160ms var(--ease-out);
+}
+.tabs button[aria-selected="true"] {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--bubble-shadow);
+}
+.tabs button:active { transform: scale(0.97); }
+
+/* Password field with a show/hide button inside it */
+.password-box { position: relative; }
+.password-box input { padding-inline-start: 46px; }
+.reveal {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  inset-inline-start: 4px;
+  width: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  border-radius: 10px;
+}
+.reveal svg { width: 19px; height: 19px; }
+.reveal:active { color: var(--text); }
+
+/* Visitor account sheet */
+.sheet {
+  width: min(420px, calc(100% - 24px));
+  max-height: calc(100% - 24px);
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--card-shadow);
+}
+.sheet::backdrop { background: rgba(10, 20, 18, 0.45); }
+.sheet form { display: flex; flex-direction: column; gap: 12px; padding: 16px 20px 20px; }
+.sheet-head { display: flex; align-items: center; justify-content: space-between; }
+.sheet-head h2 { margin: 0; font-size: 1.1rem; }
+.sheet h3 { margin: 6px 0 0; font-size: 0.95rem; color: var(--text-2); }
+.sheet-who { margin: 0; color: var(--muted); font-size: 0.9rem; }
+.sheet-who b { color: var(--text); }
+.sheet-logout { align-self: center; margin-top: 4px; }
+.sheet[open] { transition: opacity 200ms var(--ease-out), transform 200ms var(--ease-out); }
+@starting-style {
+  .sheet[open] { opacity: 0; transform: translateY(8px) scale(0.98); }
+}
 .join-foot {
   margin: 0;
   max-width: 400px;
@@ -894,9 +973,11 @@ svg { width: 20px; height: 20px; flex: none; display: block; }
   .msg-error button:hover { border-color: var(--accent); color: var(--accent); }
   .send-btn:hover:not(:disabled) { background: var(--accent-hover); }
   .jump:hover { color: var(--accent); }
+  .tabs button:hover:not([aria-selected="true"]) { color: var(--text); }
+  .reveal:hover { color: var(--text); background: var(--hover); }
 }
 
 /* Reduced motion: keep the fades that help, drop the movement. */
 @media (prefers-reduced-motion: reduce) {
-  .msg.enter, .conn, .jump { transition-property: opacity; }
+  .msg.enter, .conn, .jump, .sheet[open] { transition-property: opacity; }
 }
